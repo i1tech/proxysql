@@ -26,6 +26,13 @@ extern MySQL_STMT_Manager *GloMyStmt;
 extern MySQL_STMT_Manager_v14 *GloMyStmt;
 #endif
 
+extern SQLite3_Server *GloSQLite3Server;
+
+#ifdef PROXYSQLCLICKHOUSE
+extern ClickHouse_Authentication *GloClickHouseAuth;
+extern ClickHouse_Server *GloClickHouseServer;
+#endif /* PROXYSQLCLICKHOUSE */
+
 Session_Regex::Session_Regex(char *p) {
 	s=strdup(p);
 	re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
@@ -240,16 +247,17 @@ MySQL_Session::MySQL_Session() {
 	autocommit=true;
 	autocommit_on_hostgroup=-1;
 	killed=false;
-	admin=false;
+	session_type=PROXYSQL_SESSION_MYSQL;
+	//admin=false;
 	connections_handler=false;
 	max_connections_reached=false;
-	stats=false;
+	//stats=false;
 	client_authenticated=false;
 	default_schema=NULL;
 	schema_locked=false;
 	session_fast_forward=false;
 	started_sending_data_to_client=false;
-	admin_func=NULL;
+	handler_function=NULL;
 	client_myds=NULL;
 	to_process=0;
 	mybe=NULL;
@@ -314,7 +322,16 @@ MySQL_Session::~MySQL_Session() {
 
 	if (client_myds) {
 		if (client_authenticated) {
-			GloMyAuth->decrease_frontend_user_connections(client_myds->myconn->userinfo->username);
+			switch (session_type) {
+#ifdef PROXYSQLCLICKHOUSE
+				case PROXYSQL_SESSION_CLICKHOUSE:
+					GloClickHouseAuth->decrease_frontend_user_connections(client_myds->myconn->userinfo->username);
+					break;
+#endif /* PROXYSQLCLICKHOUSE */
+				default:
+					GloMyAuth->decrease_frontend_user_connections(client_myds->myconn->userinfo->username);
+					break;
+			}
 		}
 		delete client_myds;
 	}
@@ -323,7 +340,7 @@ MySQL_Session::~MySQL_Session() {
 	}
 	proxy_debug(PROXY_DEBUG_NET,1,"Thread=%p, Session=%p -- Shutdown Session %p\n" , this->thread, this, this);
 	delete command_counters;
-	if (admin==false && connections_handler==false && mirror==false) {
+	if (session_type==PROXYSQL_SESSION_MYSQL && connections_handler==false && mirror==false) {
 		__sync_fetch_and_sub(&MyHGM->status.client_connections,1);
 	}
 	assert(qpo);
@@ -394,7 +411,7 @@ void MySQL_Session::reset_all_backends() {
 void MySQL_Session::writeout() {
 	if (client_myds) client_myds->array2buffer_full();
 	if (mybe && mybe->server_myds && mybe->server_myds->myds_type==MYDS_BACKEND) {
-		if (admin==false) {
+		if (session_type==PROXYSQL_SESSION_MYSQL) {
 			if (mybe->server_myds->net_failure==false) { 
 				if (mybe->server_myds->poll_fds_idx>-1) { // NOTE: attempt to force writes
 					mybe->server_myds->array2buffer_full();
@@ -572,9 +589,11 @@ bool MySQL_Session::handler_special_queries(PtrSize_t *pkt) {
 		}
 	}
 
-	if (pkt->size>(5+4) && strncasecmp((char *)"USE ",(char *)pkt->ptr+5,4)==0) {
-		handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(pkt);
-		return true;
+	if (session_type != PROXYSQL_SESSION_CLICKHOUSE) {
+		if (pkt->size>(5+4) && strncasecmp((char *)"USE ",(char *)pkt->ptr+5,4)==0) {
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(pkt);
+			return true;
+		}
 	}
 
 	if (
@@ -582,7 +601,7 @@ bool MySQL_Session::handler_special_queries(PtrSize_t *pkt) {
 		||
 		(pkt->size==SELECT_LAST_INSERT_ID_LIMIT1_LEN+5 && strncasecmp((char *)SELECT_LAST_INSERT_ID_LIMIT1,(char *)pkt->ptr+5,pkt->size-5)==0)
 	) {
-		char buf[16];
+		char buf[32];
 		sprintf(buf,"%llu",last_insert_id);
 		unsigned int nTrx=NumActiveTransactions();
 		uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
@@ -604,6 +623,8 @@ bool MySQL_Session::handler_special_queries(PtrSize_t *pkt) {
 		myprot->generate_pkt_EOF(true,NULL,NULL,sid,0, setStatus); sid++;
 		myds->DSS=STATE_SLEEP;
 		l_free(pkt->size,pkt->ptr);
+		free(p);
+		free(l);
 		return true;
 	}
 	if (pkt->size==SELECT_VERSION_COMMENT_LEN+5 && strncmp((char *)SELECT_VERSION_COMMENT,(char *)pkt->ptr+5,pkt->size-5)==0) {
@@ -916,7 +937,7 @@ bool MySQL_Session::handler_again___verify_backend_sql_log_bin() {
 bool MySQL_Session::handler_again___verify_backend_sql_mode() {
 	if (mybe->server_myds->myconn->options.sql_mode_int==0) {
 		// it is the first time we use this backend. Set sql_mode to default
-		if (mybe->server_myds->myconn->options.sql_mode==NULL) {
+		if (mybe->server_myds->myconn->options.sql_mode) {
 			free(mybe->server_myds->myconn->options.sql_mode);
 			mybe->server_myds->myconn->options.sql_mode=NULL;
 		}
@@ -959,7 +980,7 @@ bool MySQL_Session::handler_again___verify_backend_sql_mode() {
 bool MySQL_Session::handler_again___verify_backend_time_zone() {
 	if (mybe->server_myds->myconn->options.time_zone_int==0) {
 		// it is the first time we use this backend. Set time_zone to default
-		if (mybe->server_myds->myconn->options.time_zone==NULL) {
+		if (mybe->server_myds->myconn->options.time_zone) {
 			free(mybe->server_myds->myconn->options.time_zone);
 			mybe->server_myds->myconn->options.time_zone=NULL;
 		}
@@ -1880,10 +1901,33 @@ __get_pkts_from_client:
 							NEXT_IMMEDIATE(CONNECTING_SERVER);  // we create a connection . next status will be FAST_FORWARD
 						}
 						c=*((unsigned char *)pkt.ptr+sizeof(mysql_hdr));
+						if (session_type == PROXYSQL_SESSION_CLICKHOUSE) {
+							if ((enum_mysql_command)c == _MYSQL_COM_INIT_DB) {
+								PtrSize_t _new_pkt;
+								_new_pkt.ptr=malloc(pkt.size+4); // USE + space
+								memcpy(_new_pkt.ptr , pkt.ptr, 4);
+								unsigned char *_c=(unsigned char *)_new_pkt.ptr;
+								_c+=4; *_c=0x03;
+								_c+=1; *_c='U';
+								_c+=1; *_c='S';
+								_c+=1; *_c='E';
+								_c+=1; *_c=' ';
+//								(unsigned char *)_new_pkt.ptr[4]=0x03;
+//								(unsigned char *)_new_pkt.ptr[5]='U';
+//								(unsigned char *)_new_pkt.ptr[6]='S';
+//								(unsigned char *)_new_pkt.ptr[7]='E';
+//								(unsigned char *)_new_pkt.ptr[8]=' ';
+								memcpy(_new_pkt.ptr+9 , pkt.ptr+5, pkt.size-5);
+								l_free(pkt.size,pkt.ptr);
+								pkt.size+=4;
+								pkt.ptr = _new_pkt.ptr;
+								c=*((unsigned char *)pkt.ptr+sizeof(mysql_hdr));
+							}
+						}
 						switch ((enum_mysql_command)c) {
 							case _MYSQL_COM_QUERY:
 								__sync_add_and_fetch(&thread->status_variables.queries,1);
-								if (admin==false) {
+								if (session_type == PROXYSQL_SESSION_MYSQL) {
 									bool rc_break=false;
 									if (session_fast_forward==false) {
 										// Note: CurrentQuery sees the query as sent by the client.
@@ -1955,9 +1999,26 @@ __get_pkts_from_client:
 									mybe->server_myds->mysql_real_query.init(&pkt);
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
 								} else {
-									// this is processed by the admin module
-									admin_func(this, GloAdmin, &pkt);
-									l_free(pkt.size,pkt.ptr);
+									switch (session_type) {
+										case PROXYSQL_SESSION_ADMIN:
+										case PROXYSQL_SESSION_STATS:
+										// this is processed by the admin module
+											handler_function(this, (void *)GloAdmin, &pkt);
+											l_free(pkt.size,pkt.ptr);
+											break;
+										case PROXYSQL_SESSION_SQLITE:
+											handler_function(this, (void *)GloSQLite3Server, &pkt);
+											l_free(pkt.size,pkt.ptr);
+											break;
+#ifdef PROXYSQLCLICKHOUSE
+										case PROXYSQL_SESSION_CLICKHOUSE:
+											handler_function(this, (void *)GloClickHouseServer, &pkt);
+											l_free(pkt.size,pkt.ptr);
+											break;
+#endif /* PROXYSQLCLICKHOUSE */
+										default:
+											assert(0);
+									}
 								}
 								break;
 							case _MYSQL_COM_CHANGE_USER:
@@ -2017,7 +2078,7 @@ __get_pkts_from_client:
 								l_free(pkt.size,pkt.ptr);
 								break;
 							case _MYSQL_COM_STMT_PREPARE:
-								if (admin==true) { // admin module will not support prepared statement!!
+								if (session_type != PROXYSQL_SESSION_MYSQL) { // only MySQL module supports prepared statement!!
 									l_free(pkt.size,pkt.ptr);
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
 									client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported");
@@ -2027,7 +2088,7 @@ __get_pkts_from_client:
 								} else {
 									thread->status_variables.frontend_stmt_prepare++;
 									thread->status_variables.queries++;
-									// if we reach here, we are not on admin
+									// if we reach here, we are not on MySQL module
 									bool rc_break=false;
 
 									// Note: CurrentQuery sees the query as sent by the client.
@@ -2116,7 +2177,7 @@ __get_pkts_from_client:
 								}
 								break;
 							case _MYSQL_COM_STMT_EXECUTE:
-								if (admin==true) { // admin module will not support prepared statement!!
+								if (session_type != PROXYSQL_SESSION_MYSQL) { // only MySQL module supports prepared statement!!
 									l_free(pkt.size,pkt.ptr);
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
 									client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported");
@@ -2124,7 +2185,7 @@ __get_pkts_from_client:
 									status=WAITING_CLIENT_DATA;
 									break;
 								} else {
-									// if we reach here, we are not on admin
+									// if we reach here, we are on MySQL module
 									thread->status_variables.frontend_stmt_execute++;
 									thread->status_variables.queries++;
 									//bool rc_break=false;
@@ -2587,7 +2648,7 @@ handler_again:
 							myconn->multiplex_delayed=false;
 							myds->wait_until=0;
 							myds->DSS=STATE_NOT_INITIALIZED;
-							if (mysql_thread___autocommit_false_not_reusable && myds->myconn->IsAutoCommit()==true) {
+							if (mysql_thread___autocommit_false_not_reusable && myds->myconn->IsAutoCommit()==false) {
 								myds->destroy_MySQL_Connection_From_Pool(true);
 							} else {
 								myds->return_MySQL_Connection_To_Pool();
@@ -2775,7 +2836,7 @@ handler_again:
 							RequestEnd(myds);
 							if (mysql_thread___multiplexing && (myds->myconn->reusable==true) && myds->myconn->IsActiveTransaction()==false && myds->myconn->MultiplexDisabled()==false) {
 								myds->DSS=STATE_NOT_INITIALIZED;
-								if (mysql_thread___autocommit_false_not_reusable && myds->myconn->IsAutoCommit()==true) {
+								if (mysql_thread___autocommit_false_not_reusable && myds->myconn->IsAutoCommit()==false) {
 									myds->destroy_MySQL_Connection_From_Pool(true);
 								} else {
 									myds->return_MySQL_Connection_To_Pool();
@@ -3023,12 +3084,22 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 	if ( 
 		(client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size)==true) 
 		&&
-		( (default_hostgroup<0 && admin==true) || (default_hostgroup>=0 && admin==false) || strncmp(client_myds->myconn->userinfo->username,mysql_thread___monitor_username,strlen(mysql_thread___monitor_username))==0 ) // Do not delete this line. See bug #492
+		(
+			//(default_hostgroup<0 && ( session_type == PROXYSQL_SESSION_ADMIN || session_type == PROXYSQL_SESSION_STATS || session_type == PROXYSQL_SESSION_SQLITE) )
+			(default_hostgroup<0 && ( session_type == PROXYSQL_SESSION_ADMIN || session_type == PROXYSQL_SESSION_STATS) )
+			||
+			(default_hostgroup == 0 && session_type == PROXYSQL_SESSION_CLICKHOUSE)
+			||
+			//(default_hostgroup>=0 && session_type == PROXYSQL_SESSION_MYSQL)
+			(default_hostgroup>=0 && ( session_type == PROXYSQL_SESSION_MYSQL || session_type == PROXYSQL_SESSION_SQLITE ) )
+			||
+			strncmp(client_myds->myconn->userinfo->username,mysql_thread___monitor_username,strlen(mysql_thread___monitor_username))==0 
+		) // Do not delete this line. See bug #492
 	)	{
-		if (admin==true) {
+		if (session_type == PROXYSQL_SESSION_ADMIN) {
 			if ( (default_hostgroup<0) || (strncmp(client_myds->myconn->userinfo->username,mysql_thread___monitor_username,strlen(mysql_thread___monitor_username))==0) ) {
 				if (default_hostgroup==STATS_HOSTGROUP) {
-					stats=true;
+					session_type = PROXYSQL_SESSION_STATS;
 				}
 			}
 		}
@@ -3039,9 +3110,23 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 			}
 			int free_users=0;
 			int used_users=0;
-			if (admin==false) {
+			if (session_type == PROXYSQL_SESSION_MYSQL || session_type == PROXYSQL_SESSION_CLICKHOUSE || session_type == PROXYSQL_SESSION_SQLITE) {
+			//if (session_type == PROXYSQL_SESSION_MYSQL || session_type == PROXYSQL_SESSION_CLICKHOUSE) {
 				client_authenticated=true;
-				free_users=GloMyAuth->increase_frontend_user_connections(client_myds->myconn->userinfo->username, &used_users);
+				switch (session_type) {
+					case PROXYSQL_SESSION_MYSQL:
+					case PROXYSQL_SESSION_SQLITE:
+						free_users=GloMyAuth->increase_frontend_user_connections(client_myds->myconn->userinfo->username, &used_users);
+						break;
+#ifdef PROXYSQLCLICKHOUSE
+					case PROXYSQL_SESSION_CLICKHOUSE:
+						free_users=GloClickHouseAuth->increase_frontend_user_connections(client_myds->myconn->userinfo->username, &used_users);
+						break;
+#endif /* PROXYSQLCLICKHOUSE */
+					default:
+						assert(0);
+						break;
+				}
 			} else {
 				free_users=1;
 			}
@@ -3227,7 +3312,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 }
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_FIELD_LIST(PtrSize_t *pkt) {
-	if (admin==false) {
+	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		/* FIXME: temporary */
 		l_free(pkt->size,pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
@@ -3242,7 +3327,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 }
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_STMT_PREPARE(PtrSize_t *pkt) {
-	if (admin==false) {
+	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		client_myds->myconn->has_prepared_statement=true;
 		client_myds->myconn->processing_prepared_statement_prepare=true;
 		mybe=find_or_create_backend(default_hostgroup);
@@ -3257,7 +3342,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 }
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_STMT_EXECUTE(PtrSize_t *pkt) {
-	if (admin==false) {
+	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		client_myds->myconn->processing_prepared_statement_execute=true;
 		mybe=find_or_create_backend(default_hostgroup);
 		mybe->server_myds->PSarrayOUT->add(pkt->ptr, pkt->size);
@@ -3279,7 +3364,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_INIT_DB(PtrSize_t *pkt) {
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got COM_INIT_DB packet\n");
-	if (admin==false) {
+	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		__sync_fetch_and_add(&MyHGM->status.frontend_init_db, 1);
 		client_myds->myconn->userinfo->set_schemaname((char *)pkt->ptr+sizeof(mysql_hdr)+1,pkt->size-sizeof(mysql_hdr)-1);
 		l_free(pkt->size,pkt->ptr);
@@ -3304,7 +3389,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 // some application (like the one written in Perl) do not use COM_INIT_DB , but COM_QUERY with USE dbname
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(PtrSize_t *pkt) {
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got COM_QUERY with USE dbname\n");
-	if (admin==false) {
+	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		__sync_fetch_and_add(&MyHGM->status.frontend_use_db, 1);
 		char *schemaname=strndup((char *)pkt->ptr+sizeof(mysql_hdr)+5,pkt->size-sizeof(mysql_hdr)-5);
 		char *schemanameptr=schemaname;
@@ -3563,7 +3648,8 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_CHANGE_USER(PtrSize_t *pkt, bool *wrong_pass) {
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got COM_CHANGE_USER packet\n");
-	if (admin==false) {
+	//if (session_type == PROXYSQL_SESSION_MYSQL) {
+	if (session_type == PROXYSQL_SESSION_MYSQL || session_type == PROXYSQL_SESSION_SQLITE) {
 		reset();
 		init();
 		if (client_authenticated) {
@@ -3629,7 +3715,7 @@ void MySQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		int i=100;
 		while (i) {
 			if (mc==NULL) {
-				mc=MyHGM->get_MyConn_from_pool(mybe->hostgroup_id);
+				mc=MyHGM->get_MyConn_from_pool(mybe->hostgroup_id, session_fast_forward);
 			}
 			if (mc) {
 				mybe->server_myds->attach_connection(mc);
@@ -3641,9 +3727,11 @@ void MySQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		i--;
 		}
 #else
-		mc=thread->get_MyConn_local(mybe->hostgroup_id); // experimental , #644
+		if (session_fast_forward == false) {
+			mc=thread->get_MyConn_local(mybe->hostgroup_id); // experimental , #644
+		}
 		if (mc==NULL) {
-			mc=MyHGM->get_MyConn_from_pool(mybe->hostgroup_id);
+			mc=MyHGM->get_MyConn_from_pool(mybe->hostgroup_id, session_fast_forward);
 		} else {
 			thread->status_variables.ConnPool_get_conn_immediate++;
 		}

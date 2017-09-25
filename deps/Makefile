@@ -9,8 +9,34 @@ MYCFLAGS=-O2
 MYJEOPT=--enable-xmalloc --enable-munmap --enable-prof
 endif
 
+PROXYSQLCLICKHOUSE := $(shell echo $(PROXYSQLCLICKHOUSE))
+ifeq ($(PROXYSQLCLICKHOUSE),1)
+default: libconfig libdaemon jemalloc mariadb_client re2 sqlite3 pcre clickhouse-cpp lz4 cityhash
+else
 default: libconfig libdaemon jemalloc mariadb_client re2 sqlite3 pcre
+endif
 .PHONY: default
+
+
+cityhash/cityhash/src/.libs/libcityhash.a:
+	cd cityhash && rm -rf cityhash || true
+	cd cityhash && tar -zxf cityhash.tar.gz
+	cd cityhash/cityhash && ./configure && CC=${CC} CXX=${CXX} ${MAKE}
+cityhash: cityhash/cityhash/src/.libs/libcityhash.a
+
+lz4/lz4/liblz4.a:
+	cd lz4 && rm -rf lz4-1.7.5 || true
+	cd lz4 && tar -zxf lz4-1.7.5.tar.gz
+	cd lz4/lz4 && CC=${CC} CXX=${CXX} ${MAKE}
+lz4: lz4/lz4/liblz4.a
+
+clickhouse-cpp/clickhouse-cpp/clickhouse/libclickhouse-cpp-lib.a:
+	cd clickhouse-cpp && rm -rf clickhouse-cpp || true
+	cd clickhouse-cpp && tar -zxf clickhouse-cpp.tar.gz
+	cd clickhouse-cpp/clickhouse-cpp && cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .
+	cd clickhouse-cpp/clickhouse-cpp && CC=${CC} CXX=${CXX} ${MAKE}
+
+clickhouse-cpp: clickhouse-cpp/clickhouse-cpp/clickhouse/libclickhouse-cpp-lib.a
 
 
 libdaemon/libdaemon/libdaemon/.libs/libdaemon.a: 
@@ -99,5 +125,7 @@ cleanall:
 	cd re2 && rm -rf re2
 	cd pcre && rm -rf pcre-8.39
 	cd sqlite3/sqlite3 && rm -rf * || true
+	cd clickhouse-cpp/clickhouse-cpp && rm -rf * || true
+	cd lz4 && rm -rf lz4-1.7.5 || true
 .PHONY: cleanall
 

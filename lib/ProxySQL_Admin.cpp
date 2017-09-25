@@ -142,6 +142,13 @@ extern MySQL_STMT_Manager_v14 *GloMyStmt;
 extern MySQL_Monitor *GloMyMon;
 
 extern ProxySQL_Cluster *GloProxyCluster;
+#ifdef PROXYSQLCLICKHOUSE
+extern ClickHouse_Authentication *GloClickHouseAuth;
+extern ClickHouse_Server *GloClickHouseServer;
+#endif /* PROXYSQLCLICKHOUSE */
+
+extern SQLite3_Server *GloSQLite3Server;
+
 
 #define PANIC(msg)  { perror(msg); exit(EXIT_FAILURE); }
 
@@ -169,6 +176,8 @@ pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 #define ADMIN_SQLITE_RUNTIME_MYSQL_USERS "CREATE TABLE runtime_mysql_users (username VARCHAR NOT NULL , password VARCHAR , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , use_ssl INT CHECK (use_ssl IN (0,1)) NOT NULL DEFAULT 0 , default_hostgroup INT NOT NULL DEFAULT 0 , default_schema VARCHAR , schema_locked INT CHECK (schema_locked IN (0,1)) NOT NULL DEFAULT 0 , transaction_persistent INT CHECK (transaction_persistent IN (0,1)) NOT NULL DEFAULT 1 , fast_forward INT CHECK (fast_forward IN (0,1)) NOT NULL DEFAULT 0 , backend INT CHECK (backend IN (0,1)) NOT NULL DEFAULT 1 , frontend INT CHECK (frontend IN (0,1)) NOT NULL DEFAULT 1 , max_connections INT CHECK (max_connections >=0) NOT NULL DEFAULT 10000 , PRIMARY KEY (username, backend) , UNIQUE (username, frontend))"
+
+#define ADMIN_SQLITE_RUNTIME_CHECKSUMS_VALUES "CREATE TABLE runtime_checksums_values (name VARCHAR NOT NULL , version INT NOT NULL , epoch INT NOT NULL , checksum VARCHAR NOT NULL , PRIMARY KEY (name))"
 
 // mysql_query_rules in v1.1.0
 #define ADMIN_SQLITE_TABLE_MYSQL_QUERY_RULES_V1_1_0 "CREATE TABLE mysql_query_rules (rule_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 0 , username VARCHAR , schemaname VARCHAR , flagIN INT NOT NULL DEFAULT 0 , match_digest VARCHAR , match_pattern VARCHAR , negate_match_pattern INT CHECK (negate_match_pattern IN (0,1)) NOT NULL DEFAULT 0 , flagOUT INT , replace_pattern VARCHAR , destination_hostgroup INT DEFAULT NULL , cache_ttl INT CHECK(cache_ttl > 0) , reconnect INT CHECK (reconnect IN (0,1)) DEFAULT NULL , timeout INT UNSIGNED , delay INT UNSIGNED , error_msg VARCHAR , apply INT CHECK(apply IN (0,1)) NOT NULL DEFAULT 0)"
@@ -262,6 +271,19 @@ pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define STATS_SQLITE_TABLE_PROXYSQL_SERVERS_METRICS "CREATE TABLE stats_proxysql_servers_metrics (hostname VARCHAR NOT NULL , port INT NOT NULL DEFAULT 6032 , weight INT CHECK (weight >= 0) NOT NULL DEFAULT 0 , comment VARCHAR NOT NULL DEFAULT '' , response_time_ms INT NOT NULL , Uptime_s INT NOT NULL , last_check_ms INT NOT NULL , Queries INT NOT NULL , Client_Connections_connected INT NOT NULL , Client_Connections_created INT NOT NULL , PRIMARY KEY (hostname, port) )"
 
+#define STATS_SQLITE_TABLE_PROXYSQL_SERVERS_CHECKSUMS "CREATE TABLE stats_proxysql_servers_checksums (hostname VARCHAR NOT NULL , port INT NOT NULL DEFAULT 6032 , name VARCHAR NOT NULL , version INT NOT NULL , epoch INT NOT NULL , checksum VARCHAR NOT NULL , changed_at INT NOT NULL , updated_at INT NOT NULL , diff_check INT NOT NULL , PRIMARY KEY (hostname, port, name) )"
+
+#ifdef PROXYSQLCLICKHOUSE
+// ClickHouse Tables
+
+#define ADMIN_SQLITE_TABLE_CLICKHOUSE_USERS_141 "CREATE TABLE clickhouse_users (username VARCHAR NOT NULL , password VARCHAR , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , max_connections INT CHECK (max_connections >=0) NOT NULL DEFAULT 10000 , PRIMARY KEY (username))"
+
+#define ADMIN_SQLITE_TABLE_CLICKHOUSE_USERS ADMIN_SQLITE_TABLE_CLICKHOUSE_USERS_141
+
+#define ADMIN_SQLITE_TABLE_RUNTIME_CLICKHOUSE_USERS "CREATE TABLE runtime_clickhouse_users (username VARCHAR NOT NULL , password VARCHAR , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , max_connections INT CHECK (max_connections >=0) NOT NULL DEFAULT 10000 , PRIMARY KEY (username))"
+#endif /* PROXYSQLCLICKHOUSE */
+
+
 
 
 static char * admin_variables_names[]= {
@@ -277,6 +299,18 @@ static char * admin_variables_names[]= {
 	(char *)"cluster_username",
 	(char *)"cluster_password",
 	(char *)"cluster_check_interval_ms",
+	(char *)"cluster_check_status_frequency",
+	(char *)"cluster_mysql_query_rules_diffs_before_sync",
+	(char *)"cluster_mysql_servers_diffs_before_sync",
+	(char *)"cluster_mysql_users_diffs_before_sync",
+	(char *)"cluster_proxysql_servers_diffs_before_sync",
+	(char *)"cluster_mysql_query_rules_save_to_disk",
+	(char *)"cluster_mysql_servers_save_to_disk",
+	(char *)"cluster_mysql_users_save_to_disk",
+	(char *)"cluster_proxysql_servers_save_to_disk",
+	(char *)"checksum_mysql_query_rules",
+	(char *)"checksum_mysql_servers",
+	(char *)"checksum_mysql_users",
 #ifdef DEBUG
   (char *)"debug",
 #endif /* DEBUG */
@@ -632,6 +666,12 @@ bool is_valid_global_variable(const char *var_name) {
 		return true;
 	} else if (strlen(var_name) > 6 && !strncmp(var_name, "admin-", 6) && SPA->has_variable(var_name + 6)) {
 		return true;
+	} else if (strlen(var_name) > 13 && !strncmp(var_name, "sqliteserver-", 13) && GloSQLite3Server->has_variable(var_name + 13)) {
+		return true;
+#ifdef PROXYSQLCLICKHOUSE
+	} else if (strlen(var_name) > 11 && !strncmp(var_name, "clickhouse-", 11) && GloClickHouseServer->has_variable(var_name + 11)) {
+		return true;
+#endif /* PROXYSQLCLICKHOUSE */
 	} else {
 		return false;
 	}
@@ -911,6 +951,75 @@ bool admin_handler_command_load_or_save(char *query_no_space, unsigned int query
 			}
 		}
 	}
+#ifdef PROXYSQLCLICKHOUSE
+	if ( ( GloVars.global.clickhouse_server == true ) && (query_no_space_length>22) && ( (!strncasecmp("SAVE CLICKHOUSE USERS ", query_no_space, 22)) || (!strncasecmp("LOAD CLICKHOUSE USERS ", query_no_space, 22))) ) {
+		if (
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS TO MEMORY") && !strncasecmp("LOAD CLICKHOUSE USERS TO MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS TO MEM") && !strncasecmp("LOAD CLICKHOUSE USERS TO MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS FROM DISK") && !strncasecmp("LOAD CLICKHOUSE USERS FROM DISK",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->flush_clickhouse_users__from_disk_to_memory();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loading clickhouse users to MEMORY\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+
+		if (
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS FROM MEMORY") && !strncasecmp("SAVE CLICKHOUSE USERS FROM MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS FROM MEM") && !strncasecmp("SAVE CLICKHOUSE USERS FROM MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS TO DISK") && !strncasecmp("SAVE CLICKHOUSE USERS TO DISK",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->flush_clickhouse_users__from_memory_to_disk();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Saving clickhouse users to DISK\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+
+		if (
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS FROM MEMORY") && !strncasecmp("LOAD CLICKHOUSE USERS FROM MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS FROM MEM") && !strncasecmp("LOAD CLICKHOUSE USERS FROM MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS TO RUNTIME") && !strncasecmp("LOAD CLICKHOUSE USERS TO RUNTIME",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE USERS TO RUN") && !strncasecmp("LOAD CLICKHOUSE USERS TO RUN",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->init_clickhouse_users();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loaded clickhouse users to RUNTIME\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+
+		if (
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS TO MEMORY") && !strncasecmp("SAVE CLICKHOUSE USERS TO MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS TO MEM") && !strncasecmp("SAVE CLICKHOUSE USERS TO MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS FROM RUNTIME") && !strncasecmp("SAVE CLICKHOUSE USERS FROM RUNTIME",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE USERS FROM RUN") && !strncasecmp("SAVE CLICKHOUSE USERS FROM RUN",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->save_clickhouse_users_runtime_to_database(false);
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Saved clickhouse users from RUNTIME\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+
+	}
+#endif /* PROXYSQLCLICKHOUSE */
+
 	if ((query_no_space_length>17) && ( (!strncasecmp("SAVE MYSQL USERS ", query_no_space, 17)) || (!strncasecmp("LOAD MYSQL USERS ", query_no_space, 17))) ) {
 
 		if (
@@ -1006,6 +1115,195 @@ bool admin_handler_command_load_or_save(char *query_no_space, unsigned int query
 		}
 
 	}
+	if ((query_no_space_length>28) && ( (!strncasecmp("SAVE SQLITESERVER VARIABLES ", query_no_space, 28)) || (!strncasecmp("LOAD SQLITESERVER VARIABLES ", query_no_space, 28))) ) {
+
+		if (
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES TO MEMORY") && !strncasecmp("LOAD SQLITESERVER VARIABLES TO MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES TO MEM") && !strncasecmp("LOAD SQLITESERVER VARIABLES TO MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES FROM DISK") && !strncasecmp("LOAD SQLITESERVER VARIABLES FROM DISK",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			l_free(*ql,*q);
+			*q=l_strdup("INSERT OR REPLACE INTO main.global_variables SELECT * FROM disk.global_variables WHERE variable_name LIKE 'sqliteserver-%'");
+			*ql=strlen(*q)+1;
+			return true;
+		}
+
+		if (
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES FROM MEMORY") && !strncasecmp("SAVE SQLITESERVER VARIABLES FROM MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES FROM MEM") && !strncasecmp("SAVE SQLITESERVER VARIABLES FROM MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES TO DISK") && !strncasecmp("SAVE SQLITESERVER VARIABLES TO DISK",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			l_free(*ql,*q);
+			*q=l_strdup("INSERT OR REPLACE INTO disk.global_variables SELECT * FROM main.global_variables WHERE variable_name LIKE 'sqliteserver-%'");
+			*ql=strlen(*q)+1;
+			return true;
+		}
+
+		if (
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES FROM MEMORY") && !strncasecmp("LOAD SQLITESERVER VARIABLES FROM MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES FROM MEM") && !strncasecmp("LOAD SQLITESERVER VARIABLES FROM MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES TO RUNTIME") && !strncasecmp("LOAD SQLITESERVER VARIABLES TO RUNTIME",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD SQLITESERVER VARIABLES TO RUN") && !strncasecmp("LOAD SQLITESERVER VARIABLES TO RUN",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->load_sqliteserver_variables_to_runtime();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loaded SQLiteServer variables to RUNTIME\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+
+/*
+		if (
+			(query_no_space_length==strlen("LOAD MYSQL VARIABLES FROM CONFIG") && !strncasecmp("LOAD MYSQL VARIABLES FROM CONFIG",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			if (GloVars.configfile_open) {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loading from file %s\n", GloVars.config_file);
+				if (GloVars.confFile->OpenFile(NULL)==true) {
+					int rows=0;
+					ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+					rows=SPA->Read_Global_Variables_from_configfile("mysql");
+					proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loaded mysql variables from CONFIG\n");
+					SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL, rows);
+					GloVars.confFile->CloseFile();
+				} else {
+					proxy_debug(PROXY_DEBUG_ADMIN, 4, "Unable to open or parse config file %s\n", GloVars.config_file);
+					char *s=(char *)"Unable to open or parse config file %s";
+					char *m=(char *)malloc(strlen(s)+strlen(GloVars.config_file)+1);
+					sprintf(m,s,GloVars.config_file);
+					SPA->send_MySQL_ERR(&sess->client_myds->myprot, m);
+					free(m);
+				}
+			} else {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Unknown config file\n");
+				SPA->send_MySQL_ERR(&sess->client_myds->myprot, (char *)"Config file unknown");
+			}
+			return false;
+		}
+*/
+		if (
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES TO MEMORY") && !strncasecmp("SAVE SQLITESERVER VARIABLES TO MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES TO MEM") && !strncasecmp("SAVE SQLITESERVER VARIABLES TO MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES FROM RUNTIME") && !strncasecmp("SAVE SQLITESERVER VARIABLES FROM RUNTIME",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE SQLITESERVER VARIABLES FROM RUN") && !strncasecmp("SAVE SQLITESERVER VARIABLES FROM RUN",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->save_sqliteserver_variables_from_runtime();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Saved SQLiteServer variables from RUNTIME\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+	}
+#ifdef PROXYSQLCLICKHOUSE
+	if ((query_no_space_length>26) && ( (!strncasecmp("SAVE CLICKHOUSE VARIABLES ", query_no_space, 26)) || (!strncasecmp("LOAD CLICKHOUSE VARIABLES ", query_no_space, 26))) ) {
+
+		if (
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES TO MEMORY") && !strncasecmp("LOAD CLICKHOUSE VARIABLES TO MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES TO MEM") && !strncasecmp("LOAD CLICKHOUSE VARIABLES TO MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES FROM DISK") && !strncasecmp("LOAD CLICKHOUSE VARIABLES FROM DISK",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			l_free(*ql,*q);
+			*q=l_strdup("INSERT OR REPLACE INTO main.global_variables SELECT * FROM disk.global_variables WHERE variable_name LIKE 'clickhouse-%'");
+			*ql=strlen(*q)+1;
+			return true;
+		}
+
+		if (
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES FROM MEMORY") && !strncasecmp("SAVE CLICKHOUSE VARIABLES FROM MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES FROM MEM") && !strncasecmp("SAVE CLICKHOUSE VARIABLES FROM MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES TO DISK") && !strncasecmp("SAVE CLICKHOUSE VARIABLES TO DISK",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			l_free(*ql,*q);
+			*q=l_strdup("INSERT OR REPLACE INTO disk.global_variables SELECT * FROM main.global_variables WHERE variable_name LIKE 'clickhouse-%'");
+			*ql=strlen(*q)+1;
+			return true;
+		}
+
+		if (
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES FROM MEMORY") && !strncasecmp("LOAD CLICKHOUSE VARIABLES FROM MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES FROM MEM") && !strncasecmp("LOAD CLICKHOUSE VARIABLES FROM MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES TO RUNTIME") && !strncasecmp("LOAD CLICKHOUSE VARIABLES TO RUNTIME",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("LOAD CLICKHOUSE VARIABLES TO RUN") && !strncasecmp("LOAD CLICKHOUSE VARIABLES TO RUN",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->load_clickhouse_variables_to_runtime();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loaded clickhouse variables to RUNTIME\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+
+/*
+		if (
+			(query_no_space_length==strlen("LOAD MYSQL VARIABLES FROM CONFIG") && !strncasecmp("LOAD MYSQL VARIABLES FROM CONFIG",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			if (GloVars.configfile_open) {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loading from file %s\n", GloVars.config_file);
+				if (GloVars.confFile->OpenFile(NULL)==true) {
+					int rows=0;
+					ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+					rows=SPA->Read_Global_Variables_from_configfile("mysql");
+					proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loaded mysql variables from CONFIG\n");
+					SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL, rows);
+					GloVars.confFile->CloseFile();
+				} else {
+					proxy_debug(PROXY_DEBUG_ADMIN, 4, "Unable to open or parse config file %s\n", GloVars.config_file);
+					char *s=(char *)"Unable to open or parse config file %s";
+					char *m=(char *)malloc(strlen(s)+strlen(GloVars.config_file)+1);
+					sprintf(m,s,GloVars.config_file);
+					SPA->send_MySQL_ERR(&sess->client_myds->myprot, m);
+					free(m);
+				}
+			} else {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Unknown config file\n");
+				SPA->send_MySQL_ERR(&sess->client_myds->myprot, (char *)"Config file unknown");
+			}
+			return false;
+		}
+*/
+		if (
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES TO MEMORY") && !strncasecmp("SAVE CLICKHOUSE VARIABLES TO MEMORY",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES TO MEM") && !strncasecmp("SAVE CLICKHOUSE VARIABLES TO MEM",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES FROM RUNTIME") && !strncasecmp("SAVE CLICKHOUSE VARIABLES FROM RUNTIME",query_no_space, query_no_space_length))
+			||
+			(query_no_space_length==strlen("SAVE CLICKHOUSE VARIABLES FROM RUN") && !strncasecmp("SAVE CLICKHOUSE VARIABLES FROM RUN",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+			SPA->save_clickhouse_variables_from_runtime();
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Saved clickhouse variables from RUNTIME\n");
+			SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL);
+			return false;
+		}
+	}
+#endif /* PROXYSQLCLICKHOUSE */
+
 	if ((query_no_space_length>21) && ( (!strncasecmp("SAVE MYSQL VARIABLES ", query_no_space, 21)) || (!strncasecmp("LOAD MYSQL VARIABLES ", query_no_space, 21))) ) {
 
 		if (
@@ -1267,6 +1565,34 @@ bool admin_handler_command_load_or_save(char *query_no_space, unsigned int query
 			return false;
 		}
 
+		if (
+			(query_no_space_length==strlen("LOAD PROXYSQL SERVERS FROM CONFIG") && !strncasecmp("LOAD PROXYSQL SERVERS FROM CONFIG",query_no_space, query_no_space_length))
+		) {
+			proxy_info("Received %s command\n", query_no_space);
+			if (GloVars.configfile_open) {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loading from file %s\n", GloVars.config_file);
+				if (GloVars.confFile->OpenFile(NULL)==true) {
+					ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
+					int rows=0;
+					rows=SPA->Read_ProxySQL_Servers_from_configfile();
+					proxy_debug(PROXY_DEBUG_ADMIN, 4, "Loaded ProxySQL servers from CONFIG\n");
+					SPA->send_MySQL_OK(&sess->client_myds->myprot, NULL, rows);
+					GloVars.confFile->CloseFile();
+				} else {
+					proxy_debug(PROXY_DEBUG_ADMIN, 4, "Unable to open or parse config file %s\n", GloVars.config_file);
+					char *s=(char *)"Unable to open or parse config file %s";
+					char *m=(char *)malloc(strlen(s)+strlen(GloVars.config_file)+1);
+					sprintf(m,s,GloVars.config_file);
+					SPA->send_MySQL_ERR(&sess->client_myds->myprot, m);
+					free(m);
+				}
+			} else {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Unknown config file\n");
+				SPA->send_MySQL_ERR(&sess->client_myds->myprot, (char *)"Config file unknown");
+			}
+			return false;
+		}
+
 	}
 
 	if ((query_no_space_length>23) && ( (!strncasecmp("SAVE MYSQL QUERY RULES ", query_no_space, 23)) || (!strncasecmp("LOAD MYSQL QUERY RULES ", query_no_space, 23))) ) {
@@ -1470,9 +1796,15 @@ void ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 	bool runtime_mysql_query_rules=false;
 
 	bool runtime_proxysql_servers=false;
+	bool runtime_checksums_values=false;
+
+#ifdef PROXYSQLCLICKHOUSE
+	bool runtime_clickhouse_users = false;
+#endif /* PROXYSQLCLICKHOUSE */
 
 	bool monitor_mysql_server_group_replication_log=false;
 
+	bool stats_proxysql_servers_checksums = false;
 	bool stats_proxysql_servers_metrics = false;
 	bool stats_proxysql_servers_status = false;
 
@@ -1504,6 +1836,8 @@ void ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 	if (strstr(query_no_space,"stats_mysql_users"))
 		{ stats_mysql_users=true; refresh=true; }
 
+	if (strstr(query_no_space,"stats_proxysql_servers_checksums"))
+		{ stats_proxysql_servers_checksums = true; refresh = true; }
 	if (strstr(query_no_space,"stats_proxysql_servers_metrics"))
 		{ stats_proxysql_servers_metrics = true; refresh = true; }
 	if (strstr(query_no_space,"stats_proxysql_servers_status"))
@@ -1534,6 +1868,16 @@ void ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 			if (strstr(query_no_space,"runtime_proxysql_servers")) {
 				runtime_proxysql_servers=true; refresh=true;
 			}
+			if (strstr(query_no_space,"runtime_checksums_values")) {
+				runtime_checksums_values=true; refresh=true;
+			}
+
+#ifdef PROXYSQLCLICKHOUSE
+			if (( GloVars.global.clickhouse_server == true ) && strstr(query_no_space,"runtime_clickhouse_users")) {
+				runtime_clickhouse_users=true; refresh=true;
+			}
+#endif /* PROXYSQLCLICKHOUSE */
+
 		}
 	}
 	if (strstr(query_no_space,"mysql_server_group_replication_log")) {
@@ -1570,6 +1914,9 @@ void ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 		if (stats_proxysql_servers_metrics) {
 			stats___proxysql_servers_metrics();
 		}
+		if (stats_proxysql_servers_checksums) {
+			stats___proxysql_servers_checksums();
+		}
 //		if (stats_proxysql_servers_status) {
 //			stats___proxysql_servers_status();
 //		}
@@ -1579,6 +1926,10 @@ void ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 				admindb->execute("DELETE FROM runtime_global_variables");	// extra
 				flush_admin_variables___runtime_to_database(admindb, false, false, false, true);
 				flush_mysql_variables___runtime_to_database(admindb, false, false, false, true);
+#ifdef PROXYSQLCLICKHOUSE
+				flush_clickhouse_variables___runtime_to_database(admindb, false, false, false, true);
+#endif /* PROXYSQLCLICKHOUSE */
+				flush_sqliteserver_variables___runtime_to_database(admindb, false, false, false, true);
 			}
 			if (runtime_mysql_servers) {
 				mysql_servers_wrlock();
@@ -1599,6 +1950,15 @@ void ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 			if (runtime_scheduler) {
 				save_scheduler_runtime_to_database(true);
 			}
+			if (runtime_checksums_values) {
+				dump_checksums_values_table();
+			}
+#ifdef PROXYSQLCLICKHOUSE
+			if (runtime_clickhouse_users) {
+				save_clickhouse_users_runtime_to_database(true);
+			}
+#endif /* PROXYSQLCLICKHOUSE */
+
 		}
 		if (monitor_mysql_server_group_replication_log) {
 			if (GloMyMon) {
@@ -1764,8 +2124,9 @@ SQLite3_result * ProxySQL_Admin::generate_show_table_status(const char *tablenam
 }
 
 
-void admin_session_handler(MySQL_Session *sess, ProxySQL_Admin *pa, PtrSize_t *pkt) {
+void admin_session_handler(MySQL_Session *sess, void *_pa, PtrSize_t *pkt) {
 
+	ProxySQL_Admin *pa=(ProxySQL_Admin *)_pa;
 	char *error=NULL;
 	int cols;
 	int affected_rows;
@@ -1794,7 +2155,7 @@ void admin_session_handler(MySQL_Session *sess, ProxySQL_Admin *pa, PtrSize_t *p
 
 	{
 		ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
-		SPA->GenericRefreshStatistics(query_no_space,query_no_space_length,!sess->stats);
+		SPA->GenericRefreshStatistics(query_no_space,query_no_space_length, ( sess->session_type == PROXYSQL_SESSION_ADMIN ? true : false )  );
 	}
 
 
@@ -1823,7 +2184,7 @@ void admin_session_handler(MySQL_Session *sess, ProxySQL_Admin *pa, PtrSize_t *p
 		goto __run_query;
 	}
 
-	if (sess->stats==false) {
+	if (sess->session_type == PROXYSQL_SESSION_ADMIN) { // no stats
 		if ((query_no_space_length>13) && (!strncasecmp("PULL VERSION ", query_no_space, 13))) {
 			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Received PULL command\n");
 			if ((query_no_space_length>27) && (!strncasecmp("PULL VERSION MYSQL SERVERS ", query_no_space, 27))) {
@@ -1849,6 +2210,37 @@ void admin_session_handler(MySQL_Session *sess, ProxySQL_Admin *pa, PtrSize_t *p
 				}
 			}
 		}
+
+
+		if ((query_no_space_length == strlen("SELECT GLOBAL_CHECKSUM()")) && (!strncasecmp("SELECT GLOBAL_CHECKSUM()", query_no_space, strlen("SELECT GLOBAL_CHECKSUM()")))) {
+			char buf[32];
+			pthread_mutex_lock(&GloVars.checksum_mutex);
+			sprintf(buf,"%llu",GloVars.checksums_values.global_checksum);
+			pthread_mutex_unlock(&GloVars.checksum_mutex);
+			uint16_t setStatus = 0;
+			MySQL_Data_Stream *myds=sess->client_myds;
+			MySQL_Protocol *myprot=&sess->client_myds->myprot;
+			myds->DSS=STATE_QUERY_SENT_DS;
+			int sid=1;
+			myprot->generate_pkt_column_count(true,NULL,NULL,sid,1); sid++;
+			myprot->generate_pkt_field(true,NULL,NULL,sid,(char *)"",(char *)"",(char *)"",(char *)"CHECKSUM",(char *)"",63,31,MYSQL_TYPE_LONGLONG,161,0,false,0,NULL); sid++;
+			myds->DSS=STATE_COLUMN_DEFINITION;
+			myprot->generate_pkt_EOF(true,NULL,NULL,sid,0, setStatus); sid++;
+			char **p=(char **)malloc(sizeof(char*)*1);
+			unsigned long *l=(unsigned long *)malloc(sizeof(unsigned long *)*1);
+			l[0]=strlen(buf);;
+			p[0]=buf;
+			myprot->generate_pkt_row(true,NULL,NULL,sid,1,l,p); sid++;
+			myds->DSS=STATE_ROW;
+			myprot->generate_pkt_EOF(true,NULL,NULL,sid,0, setStatus); sid++;
+			myds->DSS=STATE_SLEEP;
+			run_query=false;
+			free(l);
+			free(p);
+			goto __run_query;
+		}
+
+
 		if ((query_no_space_length>8) && (!strncasecmp("PROXYSQL ", query_no_space, 8))) {
 			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Received PROXYSQL command\n");
 			pthread_mutex_lock(&admin_mutex);
@@ -2387,7 +2779,7 @@ __end_show_commands:
 
 	if (query_no_space_length==strlen("SELECT DATABASE()") && !strncasecmp("SELECT DATABASE()",query_no_space, query_no_space_length)) {
 		l_free(query_length,query);
-		if (sess->stats==false) {
+		if (sess->session_type == PROXYSQL_SESSION_ADMIN) { // no stats
 			query=l_strdup("SELECT \"admin\" AS 'DATABASE()'");
 		} else {
 			query=l_strdup("SELECT \"stats\" AS 'DATABASE()'");
@@ -2399,7 +2791,7 @@ __end_show_commands:
 	// see issue #1022
 	if (query_no_space_length==strlen("SELECT DATABASE() AS name") && !strncasecmp("SELECT DATABASE() AS name",query_no_space, query_no_space_length)) {
 		l_free(query_length,query);
-		if (sess->stats==false) {
+		if (sess->session_type == PROXYSQL_SESSION_ADMIN) { // no stats
 			query=l_strdup("SELECT \"admin\" AS 'name'");
 		} else {
 			query=l_strdup("SELECT \"stats\" AS 'name'");
@@ -2408,7 +2800,7 @@ __end_show_commands:
 		goto __run_query;
 	}
 
-	if (sess->stats==true) {
+	if (sess->session_type == PROXYSQL_SESSION_STATS) { // no admin
 		if (
 			(strncasecmp("PRAGMA",query_no_space,6)==0)
 			||
@@ -2423,7 +2815,7 @@ __end_show_commands:
 __run_query:
 	if (run_query) {
 		ProxySQL_Admin *SPA=(ProxySQL_Admin *)pa;
-		if (sess->stats==false) {
+		if (sess->session_type == PROXYSQL_SESSION_ADMIN) { // no stats
 			if (SPA->get_read_only()) { // disable writes if the admin interface is in read_only mode
 				SPA->admindb->execute("PRAGMA query_only = ON");
 				SPA->admindb->execute_statement(query, &error , &cols , &affected_rows , &resultset);
@@ -2474,8 +2866,8 @@ void *child_mysql(void *arg) {
 	mysql_thr->refresh_variables();
 	MySQL_Session *sess=mysql_thr->create_new_session_and_client_data_stream(client);
 	sess->thread=mysql_thr;
-	sess->admin=true;
-	sess->admin_func=admin_session_handler;
+	sess->session_type = PROXYSQL_SESSION_ADMIN;
+	sess->handler_function=admin_session_handler;
 	MySQL_Data_Stream *myds=sess->client_myds;
 
 	fds[0].fd=client;
@@ -2738,6 +3130,18 @@ ProxySQL_Admin::ProxySQL_Admin() {
 	variables.cluster_username=strdup((char *)"");
 	variables.cluster_password=strdup((char *)"");
 	variables.cluster_check_interval_ms=1000;
+	variables.cluster_check_status_frequency=10;
+	variables.cluster_mysql_query_rules_diffs_before_sync = 3;
+	variables.cluster_mysql_servers_diffs_before_sync = 3;
+	variables.cluster_mysql_users_diffs_before_sync = 3;
+	variables.cluster_proxysql_servers_diffs_before_sync = 3;
+	checksum_variables.checksum_mysql_query_rules = true;
+	checksum_variables.checksum_mysql_servers = true;
+	checksum_variables.checksum_mysql_users = true;
+	variables.cluster_mysql_query_rules_save_to_disk = true;
+	variables.cluster_mysql_servers_save_to_disk = true;
+	variables.cluster_mysql_users_save_to_disk = true;
+	variables.cluster_proxysql_servers_save_to_disk = true;
 #ifdef DEBUG
 	variables.debug=GloVars.global.gdbg;
 #endif /* DEBUG */
@@ -2842,6 +3246,7 @@ bool ProxySQL_Admin::init() {
 	insert_into_tables_defs(tables_defs_admin,"runtime_mysql_servers", ADMIN_SQLITE_TABLE_RUNTIME_MYSQL_SERVERS);
 	insert_into_tables_defs(tables_defs_admin,"mysql_users", ADMIN_SQLITE_TABLE_MYSQL_USERS);
 	insert_into_tables_defs(tables_defs_admin,"runtime_mysql_users", ADMIN_SQLITE_RUNTIME_MYSQL_USERS);
+	insert_into_tables_defs(tables_defs_admin,"runtime_checksums_values", ADMIN_SQLITE_RUNTIME_CHECKSUMS_VALUES);
 	insert_into_tables_defs(tables_defs_admin,"runtime_mysql_replication_hostgroups", ADMIN_SQLITE_TABLE_RUNTIME_MYSQL_REPLICATION_HOSTGROUPS);
 	insert_into_tables_defs(tables_defs_admin,"mysql_replication_hostgroups", ADMIN_SQLITE_TABLE_MYSQL_REPLICATION_HOSTGROUPS);
 	insert_into_tables_defs(tables_defs_admin,"mysql_group_replication_hostgroups", ADMIN_SQLITE_TABLE_MYSQL_GROUP_REPLICATION_HOSTGROUPS);
@@ -2856,6 +3261,13 @@ bool ProxySQL_Admin::init() {
 #ifdef DEBUG
 	insert_into_tables_defs(tables_defs_admin,"debug_levels", ADMIN_SQLITE_TABLE_DEBUG_LEVELS);
 #endif /* DEBUG */
+#ifdef PROXYSQLCLICKHOUSE
+	// ClickHouse
+	if (GloVars.global.clickhouse_server) {
+		insert_into_tables_defs(tables_defs_admin,"clickhouse_users", ADMIN_SQLITE_TABLE_CLICKHOUSE_USERS);
+		insert_into_tables_defs(tables_defs_admin,"runtime_clickhouse_users", ADMIN_SQLITE_TABLE_RUNTIME_CLICKHOUSE_USERS);
+	}
+#endif /* PROXYSQLCLICKHOUSE */
 
 	insert_into_tables_defs(tables_defs_config,"mysql_servers", ADMIN_SQLITE_TABLE_MYSQL_SERVERS);
 	insert_into_tables_defs(tables_defs_config,"mysql_users", ADMIN_SQLITE_TABLE_MYSQL_USERS);
@@ -2869,7 +3281,12 @@ bool ProxySQL_Admin::init() {
 #ifdef DEBUG
 	insert_into_tables_defs(tables_defs_config,"debug_levels", ADMIN_SQLITE_TABLE_DEBUG_LEVELS);
 #endif /* DEBUG */
-
+#ifdef PROXYSQLCLICKHOUSE
+	// ClickHouse
+	if (GloVars.global.clickhouse_server) {
+		insert_into_tables_defs(tables_defs_config,"clickhouse_users", ADMIN_SQLITE_TABLE_CLICKHOUSE_USERS);
+	}
+#endif /* PROXYSQLCLICKHOUSE */
 
 	insert_into_tables_defs(tables_defs_stats,"stats_mysql_query_rules", STATS_SQLITE_TABLE_MYSQL_QUERY_RULES);
 	insert_into_tables_defs(tables_defs_stats,"stats_mysql_commands_counters", STATS_SQLITE_TABLE_MYSQL_COMMANDS_COUNTERS);
@@ -2887,6 +3304,7 @@ bool ProxySQL_Admin::init() {
 	insert_into_tables_defs(tables_defs_admin,"proxysql_servers", ADMIN_SQLITE_TABLE_PROXYSQL_SERVERS);
 	insert_into_tables_defs(tables_defs_config,"proxysql_servers", ADMIN_SQLITE_TABLE_PROXYSQL_SERVERS);
 	insert_into_tables_defs(tables_defs_admin,"runtime_proxysql_servers", ADMIN_SQLITE_TABLE_RUNTIME_PROXYSQL_SERVERS);
+	insert_into_tables_defs(tables_defs_stats,"stats_proxysql_servers_checksums", STATS_SQLITE_TABLE_PROXYSQL_SERVERS_CHECKSUMS);
 	insert_into_tables_defs(tables_defs_stats,"stats_proxysql_servers_metrics", STATS_SQLITE_TABLE_PROXYSQL_SERVERS_METRICS);
 	insert_into_tables_defs(tables_defs_stats,"stats_proxysql_servers_status", STATS_SQLITE_TABLE_PROXYSQL_SERVERS_STATUS);
 
@@ -2952,6 +3370,7 @@ bool ProxySQL_Admin::init() {
 				Read_MySQL_Users_from_configfile();
 				Read_MySQL_Query_Rules_from_configfile();
 				Read_Scheduler_from_configfile();
+				Read_ProxySQL_Servers_from_configfile();
 				__insert_or_replace_disktable_select_maintable();
 			} else {
 				if (GloVars.confFile->OpenFile(GloVars.config_file)==true) {
@@ -2961,6 +3380,7 @@ bool ProxySQL_Admin::init() {
 					Read_Global_Variables_from_configfile("admin");
 					Read_Global_Variables_from_configfile("mysql");
 					Read_Scheduler_from_configfile();
+					Read_ProxySQL_Servers_from_configfile();
 					__insert_or_replace_disktable_select_maintable();
 				}
 			}
@@ -2968,6 +3388,10 @@ bool ProxySQL_Admin::init() {
 	}
 	flush_admin_variables___database_to_runtime(admindb,true);
 	flush_mysql_variables___database_to_runtime(admindb,true);
+#ifdef PROXYSQLCLICKHOUSE
+	flush_clickhouse_variables___database_to_runtime(admindb,true);
+#endif /* PROXYSQLCLICKHOUSE */
+	flush_sqliteserver_variables___database_to_runtime(admindb,true);
 
 	if (GloVars.__cmd_proxysql_admin_socket) {
 		set_variable((char *)"mysql_ifaces",GloVars.__cmd_proxysql_admin_socket);
@@ -2997,6 +3421,21 @@ bool ProxySQL_Admin::init() {
 	return true;
 };
 
+
+
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::init_clickhouse_variables() {
+	flush_clickhouse_variables___runtime_to_database(configdb, false, false, false);
+	flush_clickhouse_variables___runtime_to_database(admindb, false, true, false);
+	flush_clickhouse_variables___database_to_runtime(admindb,true);
+}
+#endif /* CLICKHOUSE */
+
+void ProxySQL_Admin::init_sqliteserver_variables() {
+	flush_sqliteserver_variables___runtime_to_database(configdb, false, false, false);
+	flush_sqliteserver_variables___runtime_to_database(admindb, false, true, false);
+	flush_sqliteserver_variables___database_to_runtime(admindb,true);
+}
 
 void ProxySQL_Admin::admin_shutdown() {
 	int i;
@@ -3214,6 +3653,255 @@ void ProxySQL_Admin::flush_mysql_variables___database_to_runtime(SQLite3DB *db, 
 	if (resultset) delete resultset;
 }
 
+void ProxySQL_Admin::flush_sqliteserver_variables___database_to_runtime(SQLite3DB *db, bool replace) {
+	proxy_debug(PROXY_DEBUG_ADMIN, 4, "Flushing SQLiteServer variables. Replace:%d\n", replace);
+	if (
+		(GloVars.global.sqlite3_server == false)
+		||
+		( GloSQLite3Server == NULL )
+	) {
+		return;
+	}
+	char *error=NULL;
+	int cols=0;
+	int affected_rows=0;
+	SQLite3_result *resultset=NULL;
+	char *q=(char *)"SELECT substr(variable_name,14) vn, variable_value FROM global_variables WHERE variable_name LIKE 'sqliteserver-%'";
+	admindb->execute_statement(q, &error , &cols , &affected_rows , &resultset);
+	if (error) {
+		proxy_error("Error on %s : %s\n", q, error);
+		return;
+	} else {
+		GloSQLite3Server->wrlock();
+		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+			SQLite3_row *r=*it;
+			bool rc=GloSQLite3Server->set_variable(r->fields[0],r->fields[1]);
+			if (rc==false) {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Impossible to set variable %s with value \"%s\"\n", r->fields[0],r->fields[1]);
+				if (replace) {
+					char *val=GloSQLite3Server->get_variable(r->fields[0]);
+					char q[1000];
+					if (val) {
+						if (strcmp(val,r->fields[1])) {
+							proxy_warning("Impossible to set variable %s with value \"%s\". Resetting to current \"%s\".\n", r->fields[0],r->fields[1], val);
+							sprintf(q,"INSERT OR REPLACE INTO global_variables VALUES(\"sqliteserver-%s\",\"%s\")",r->fields[0],val);
+							db->execute(q);
+						}
+						free(val);
+					} else {
+						if (strcmp(r->fields[0],(char *)"session_debug")==0) {
+							sprintf(q,"DELETE FROM disk.global_variables WHERE variable_name=\"sqliteserver-%s\"",r->fields[0]);
+							db->execute(q);
+						} else {
+							proxy_warning("Impossible to set not existing variable %s with value \"%s\". Deleting. If the variable name is correct, this version doesn't support it\n", r->fields[0],r->fields[1]);
+						}
+						sprintf(q,"DELETE FROM global_variables WHERE variable_name=\"sqliteserver-%s\"",r->fields[0]);
+						db->execute(q);
+					}
+				}
+			} else {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Set variable %s with value \"%s\"\n", r->fields[0],r->fields[1]);
+			}
+		}
+		//GloClickHouse->commit();
+		GloSQLite3Server->wrunlock();
+	}
+	if (resultset) delete resultset;
+}
+
+void ProxySQL_Admin::flush_sqliteserver_variables___runtime_to_database(SQLite3DB *db, bool replace, bool del, bool onlyifempty, bool runtime) {
+	proxy_debug(PROXY_DEBUG_ADMIN, 4, "Flushing ClickHouse variables. Replace:%d, Delete:%d, Only_If_Empty:%d\n", replace, del, onlyifempty);
+	if (GloVars.global.sqlite3_server == false) {
+		return;
+	}
+	if (onlyifempty) {
+		char *error=NULL;
+	  int cols=0;
+	  int affected_rows=0;
+	  SQLite3_result *resultset=NULL;
+	  char *q=(char *)"SELECT COUNT(*) FROM global_variables WHERE variable_name LIKE 'sqliteserver-%'";
+	  db->execute_statement(q, &error , &cols , &affected_rows , &resultset);
+		int matching_rows=0;
+		if (error) {
+			proxy_error("Error on %s : %s\n", q, error);
+			return;
+		} else {
+			for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+				SQLite3_row *r=*it;
+				matching_rows+=atoi(r->fields[0]);
+			}
+	  }
+	  if (resultset) delete resultset;
+		if (matching_rows) {
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Table global_variables has ClickHouse variables - skipping\n");
+			return;
+		}
+	}
+	if (del) {
+		proxy_debug(PROXY_DEBUG_ADMIN, 4, "Deleting ClickHouse variables from global_variables\n");
+		db->execute("DELETE FROM global_variables WHERE variable_name LIKE 'sqliteserver-%'");
+	}
+	if (runtime) {
+		db->execute("DELETE FROM runtime_global_variables WHERE variable_name LIKE 'sqliteserver-%'");
+	}
+	char *a;
+	char *b=(char *)"INSERT INTO runtime_global_variables(variable_name, variable_value) VALUES(\"sqliteserver-%s\",\"%s\")";
+  if (replace) {
+    a=(char *)"REPLACE INTO global_variables(variable_name, variable_value) VALUES(\"sqliteserver-%s\",\"%s\")";
+  } else {
+    a=(char *)"INSERT OR IGNORE INTO global_variables(variable_name, variable_value) VALUES(\"sqliteserver-%s\",\"%s\")";
+  }
+  int l=strlen(a)+200;
+	GloSQLite3Server->wrlock();
+	char **varnames=GloSQLite3Server->get_variables_list();
+	for (int i=0; varnames[i]; i++) {
+		char *val=GloSQLite3Server->get_variable(varnames[i]);
+		l+=( varnames[i] ? strlen(varnames[i]) : 6);
+		l+=( val ? strlen(val) : 6);
+		char *query=(char *)malloc(l);
+		sprintf(query, a, varnames[i], val);
+		if (runtime) {
+			db->execute(query);
+			sprintf(query, b, varnames[i], val);
+		}
+		db->execute(query);
+		if (val)
+			free(val);
+		free(query);
+	}
+	GloSQLite3Server->wrunlock();
+	for (int i=0; varnames[i]; i++) {
+		free(varnames[i]);
+	}
+	free(varnames);
+}
+
+
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::flush_clickhouse_variables___database_to_runtime(SQLite3DB *db, bool replace) {
+	proxy_debug(PROXY_DEBUG_ADMIN, 4, "Flushing ClickHouse variables. Replace:%d\n", replace);
+	if (
+		(GloVars.global.clickhouse_server == false)
+		||
+		( GloClickHouseServer == NULL )
+	) {
+		return;
+	}
+	char *error=NULL;
+	int cols=0;
+	int affected_rows=0;
+	SQLite3_result *resultset=NULL;
+	char *q=(char *)"SELECT substr(variable_name,12) vn, variable_value FROM global_variables WHERE variable_name LIKE 'clickhouse-%'";
+	admindb->execute_statement(q, &error , &cols , &affected_rows , &resultset);
+	if (error) {
+		proxy_error("Error on %s : %s\n", q, error);
+		return;
+	} else {
+		GloClickHouseServer->wrlock();
+		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+			SQLite3_row *r=*it;
+			bool rc=GloClickHouseServer->set_variable(r->fields[0],r->fields[1]);
+			if (rc==false) {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Impossible to set variable %s with value \"%s\"\n", r->fields[0],r->fields[1]);
+				if (replace) {
+					char *val=GloClickHouseServer->get_variable(r->fields[0]);
+					char q[1000];
+					if (val) {
+						if (strcmp(val,r->fields[1])) {
+							proxy_warning("Impossible to set variable %s with value \"%s\". Resetting to current \"%s\".\n", r->fields[0],r->fields[1], val);
+							sprintf(q,"INSERT OR REPLACE INTO global_variables VALUES(\"clickhouse-%s\",\"%s\")",r->fields[0],val);
+							db->execute(q);
+						}
+						free(val);
+					} else {
+						if (strcmp(r->fields[0],(char *)"session_debug")==0) {
+							sprintf(q,"DELETE FROM disk.global_variables WHERE variable_name=\"clickhouse-%s\"",r->fields[0]);
+							db->execute(q);
+						} else {
+							proxy_warning("Impossible to set not existing variable %s with value \"%s\". Deleting. If the variable name is correct, this version doesn't support it\n", r->fields[0],r->fields[1]);
+						}
+						sprintf(q,"DELETE FROM global_variables WHERE variable_name=\"clickhouse-%s\"",r->fields[0]);
+						db->execute(q);
+					}
+				}
+			} else {
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "Set variable %s with value \"%s\"\n", r->fields[0],r->fields[1]);
+			}
+		}
+		//GloClickHouse->commit();
+		GloClickHouseServer->wrunlock();
+	}
+	if (resultset) delete resultset;
+}
+
+void ProxySQL_Admin::flush_clickhouse_variables___runtime_to_database(SQLite3DB *db, bool replace, bool del, bool onlyifempty, bool runtime) {
+	proxy_debug(PROXY_DEBUG_ADMIN, 4, "Flushing ClickHouse variables. Replace:%d, Delete:%d, Only_If_Empty:%d\n", replace, del, onlyifempty);
+	if (GloVars.global.clickhouse_server == false) {
+		return;
+	}
+	if (onlyifempty) {
+		char *error=NULL;
+	  int cols=0;
+	  int affected_rows=0;
+	  SQLite3_result *resultset=NULL;
+	  char *q=(char *)"SELECT COUNT(*) FROM global_variables WHERE variable_name LIKE 'clickhouse-%'";
+	  db->execute_statement(q, &error , &cols , &affected_rows , &resultset);
+		int matching_rows=0;
+		if (error) {
+			proxy_error("Error on %s : %s\n", q, error);
+			return;
+		} else {
+			for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+				SQLite3_row *r=*it;
+				matching_rows+=atoi(r->fields[0]);
+			}
+	  }
+	  if (resultset) delete resultset;
+		if (matching_rows) {
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Table global_variables has ClickHouse variables - skipping\n");
+			return;
+		}
+	}
+	if (del) {
+		proxy_debug(PROXY_DEBUG_ADMIN, 4, "Deleting ClickHouse variables from global_variables\n");
+		db->execute("DELETE FROM global_variables WHERE variable_name LIKE 'clickhouse-%'");
+	}
+	if (runtime) {
+		db->execute("DELETE FROM runtime_global_variables WHERE variable_name LIKE 'clickhouse-%'");
+	}
+	char *a;
+	char *b=(char *)"INSERT INTO runtime_global_variables(variable_name, variable_value) VALUES(\"clickhouse-%s\",\"%s\")";
+  if (replace) {
+    a=(char *)"REPLACE INTO global_variables(variable_name, variable_value) VALUES(\"clickhouse-%s\",\"%s\")";
+  } else {
+    a=(char *)"INSERT OR IGNORE INTO global_variables(variable_name, variable_value) VALUES(\"clickhouse-%s\",\"%s\")";
+  }
+  int l=strlen(a)+200;
+	GloClickHouseServer->wrlock();
+	char **varnames=GloClickHouseServer->get_variables_list();
+	for (int i=0; varnames[i]; i++) {
+		char *val=GloClickHouseServer->get_variable(varnames[i]);
+		l+=( varnames[i] ? strlen(varnames[i]) : 6);
+		l+=( val ? strlen(val) : 6);
+		char *query=(char *)malloc(l);
+		sprintf(query, a, varnames[i], val);
+		if (runtime) {
+			db->execute(query);
+			sprintf(query, b, varnames[i], val);
+		}
+		db->execute(query);
+		if (val)
+			free(val);
+		free(query);
+	}
+	GloClickHouseServer->wrunlock();
+	for (int i=0; varnames[i]; i++) {
+		free(varnames[i]);
+	}
+	free(varnames);
+}
+#endif /* PROXYSQLCLICKHOUSE */
+
 void ProxySQL_Admin::flush_mysql_variables___runtime_to_database(SQLite3DB *db, bool replace, bool del, bool onlyifempty, bool runtime) {
 	proxy_debug(PROXY_DEBUG_ADMIN, 4, "Flushing MySQL variables. Replace:%d, Delete:%d, Only_If_Empty:%d\n", replace, del, onlyifempty);
 	if (onlyifempty) {
@@ -3316,6 +4004,38 @@ char * ProxySQL_Admin::get_variable(char *name) {
 		sprintf(intbuf,"%d",variables.cluster_check_interval_ms);
 		return strdup(intbuf);
 	}
+	if (!strcasecmp(name,"cluster_check_status_frequency")) {
+		sprintf(intbuf,"%d",variables.cluster_check_status_frequency);
+		return strdup(intbuf);
+	}
+	if (!strcasecmp(name,"cluster_mysql_query_rules_diffs_before_sync")) {
+		sprintf(intbuf,"%d",variables.cluster_mysql_query_rules_diffs_before_sync);
+		return strdup(intbuf);
+	}
+	if (!strcasecmp(name,"cluster_mysql_servers_diffs_before_sync")) {
+		sprintf(intbuf,"%d",variables.cluster_mysql_servers_diffs_before_sync);
+		return strdup(intbuf);
+	}
+	if (!strcasecmp(name,"cluster_mysql_users_diffs_before_sync")) {
+		sprintf(intbuf,"%d",variables.cluster_mysql_users_diffs_before_sync);
+		return strdup(intbuf);
+	}
+	if (!strcasecmp(name,"cluster_proxysql_servers_diffs_before_sync")) {
+		sprintf(intbuf,"%d",variables.cluster_proxysql_servers_diffs_before_sync);
+		return strdup(intbuf);
+	}
+	if (!strcasecmp(name,"cluster_mysql_query_rules_save_to_disk")) {
+		return strdup((variables.cluster_mysql_query_rules_save_to_disk ? "true" : "false"));
+	}
+	if (!strcasecmp(name,"cluster_mysql_servers_save_to_disk")) {
+		return strdup((variables.cluster_mysql_servers_save_to_disk ? "true" : "false"));
+	}
+	if (!strcasecmp(name,"cluster_mysql_users_save_to_disk")) {
+		return strdup((variables.cluster_mysql_users_save_to_disk ? "true" : "false"));
+	}
+	if (!strcasecmp(name,"cluster_proxysql_servers_save_to_disk")) {
+		return strdup((variables.cluster_proxysql_servers_save_to_disk ? "true" : "false"));
+	}
 	if (!strcasecmp(name,"refresh_interval")) {
 		sprintf(intbuf,"%d",variables.refresh_interval);
 		return strdup(intbuf);
@@ -3325,6 +4045,15 @@ char * ProxySQL_Admin::get_variable(char *name) {
 	}
 	if (!strcasecmp(name,"hash_passwords")) {
 		return strdup((variables.hash_passwords ? "true" : "false"));
+	}
+	if (!strcasecmp(name,"checksum_mysql_query_rules")) {
+		return strdup((checksum_variables.checksum_mysql_query_rules ? "true" : "false"));
+	}
+	if (!strcasecmp(name,"checksum_mysql_servers")) {
+		return strdup((checksum_variables.checksum_mysql_servers ? "true" : "false"));
+	}
+	if (!strcasecmp(name,"checksum_mysql_users")) {
+		return strdup((checksum_variables.checksum_mysql_users ? "true" : "false"));
 	}
 #ifdef DEBUG
 	if (!strcasecmp(name,"debug")) {
@@ -3517,6 +4246,56 @@ bool ProxySQL_Admin::set_variable(char *name, char *value) {  // this is the pub
 			return false;
 		}
 	}
+	if (!strcasecmp(name,"cluster_check_status_frequency")) {
+		int intv=atoi(value);
+		if (intv >= 0 && intv <= 10000) {
+			variables.cluster_check_status_frequency=intv;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_check_status_frequency, intv);
+			return true;
+		} else {
+			return false;
+		}
+	}
+	if (!strcasecmp(name,"cluster_mysql_query_rules_diffs_before_sync")) {
+		int intv=atoi(value);
+		if (intv >= 0 && intv <= 1000) {
+			variables.cluster_mysql_query_rules_diffs_before_sync=intv;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_query_rules_diffs_before_sync, intv);
+			return true;
+		} else {
+			return false;
+		}
+	}
+	if (!strcasecmp(name,"cluster_mysql_servers_diffs_before_sync")) {
+		int intv=atoi(value);
+		if (intv >= 0 && intv <= 1000) {
+			variables.cluster_mysql_servers_diffs_before_sync=intv;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_servers_diffs_before_sync, intv);
+			return true;
+		} else {
+			return false;
+		}
+	}
+	if (!strcasecmp(name,"cluster_mysql_users_diffs_before_sync")) {
+		int intv=atoi(value);
+		if (intv >= 0 && intv <= 1000) {
+			variables.cluster_mysql_users_diffs_before_sync=intv;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_users_diffs_before_sync, intv);
+			return true;
+		} else {
+			return false;
+		}
+	}
+	if (!strcasecmp(name,"cluster_proxysql_servers_diffs_before_sync")) {
+		int intv=atoi(value);
+		if (intv >= 0 && intv <= 1000) {
+			variables.cluster_proxysql_servers_diffs_before_sync=intv;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_proxysql_servers_diffs_before_sync, intv);
+			return true;
+		} else {
+			return false;
+		}
+	}
 	if (!strcasecmp(name,"version")) {
 		if (strcasecmp(value,(char *)PROXYSQL_VERSION)==0) {
 			return true;
@@ -3531,6 +4310,91 @@ bool ProxySQL_Admin::set_variable(char *name, char *value) {  // this is the pub
 		}
 		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
 			variables.hash_passwords=false;
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"cluster_mysql_query_rules_save_to_disk")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			variables.cluster_mysql_query_rules_save_to_disk=true;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_query_rules_save_to_disk, true);
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			variables.cluster_mysql_query_rules_save_to_disk=false;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_query_rules_save_to_disk, false);
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"cluster_mysql_servers_save_to_disk")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			variables.cluster_mysql_servers_save_to_disk=true;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_servers_save_to_disk, true);
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			variables.cluster_mysql_servers_save_to_disk=false;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_servers_save_to_disk, false);
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"cluster_mysql_users_save_to_disk")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			variables.cluster_mysql_users_save_to_disk=true;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_users_save_to_disk, true);
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			variables.cluster_mysql_users_save_to_disk=false;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_mysql_users_save_to_disk, false);
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"cluster_proxysql_servers_save_to_disk")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			variables.cluster_proxysql_servers_save_to_disk=true;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_proxysql_servers_save_to_disk, true);
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			variables.cluster_proxysql_servers_save_to_disk=false;
+			__sync_lock_test_and_set(&GloProxyCluster->cluster_proxysql_servers_save_to_disk, false);
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"checksum_mysql_query_rules")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			checksum_variables.checksum_mysql_query_rules=true;
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			checksum_variables.checksum_mysql_query_rules=false;
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"checksum_mysql_servers")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			checksum_variables.checksum_mysql_servers=true;
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			checksum_variables.checksum_mysql_servers=false;
+			return true;
+		}
+		return false;
+	}
+	if (!strcasecmp(name,"checksum_mysql_users")) {
+		if (strcasecmp(value,"true")==0 || strcasecmp(value,"1")==0) {
+			checksum_variables.checksum_mysql_users=true;
+			return true;
+		}
+		if (strcasecmp(value,"false")==0 || strcasecmp(value,"0")==0) {
+			checksum_variables.checksum_mysql_users=false;
 			return true;
 		}
 		return false;
@@ -3943,6 +4807,40 @@ void ProxySQL_Admin::stats___mysql_query_rules() {
 	delete resultset;
 }
 
+void ProxySQL_Admin::stats___proxysql_servers_checksums() {
+	statsdb->execute("BEGIN");
+	statsdb->execute("DELETE FROM stats_proxysql_servers_checksums");
+	SQLite3_result *resultset=NULL;
+	resultset=GloProxyCluster->get_stats_proxysql_servers_checksums();
+	if (resultset) {
+		int rc;
+		sqlite3_stmt *statement1=NULL;
+		sqlite3 *mydb3=statsdb->get_db();
+		char *query1=NULL;
+		query1=(char *)"INSERT INTO stats_proxysql_servers_checksums VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+		rc=sqlite3_prepare_v2(mydb3, query1, -1, &statement1, 0);
+		assert(rc==SQLITE_OK);
+		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+			SQLite3_row *r1=*it;
+			rc=sqlite3_bind_text(statement1, 1, r1->fields[0], -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_int64(statement1, 2, atoi(r1->fields[1])); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_text(statement1, 3, r1->fields[2], -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_int64(statement1, 4, atoi(r1->fields[3])); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_int64(statement1, 5, atoi(r1->fields[4])); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_text(statement1, 6, r1->fields[5], -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_int64(statement1, 7, atoi(r1->fields[6])); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_int64(statement1, 8, atoi(r1->fields[7])); assert(rc==SQLITE_OK);
+			rc=sqlite3_bind_int64(statement1, 9, atoi(r1->fields[8])); assert(rc==SQLITE_OK);
+			SAFE_SQLITE3_STEP(statement1);
+			rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+			rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+		}
+		sqlite3_finalize(statement1);
+	}
+	statsdb->execute("COMMIT");
+	delete resultset;
+}
+
 void ProxySQL_Admin::stats___proxysql_servers_metrics() {
 	//SQLite3_result * resultset=GloProxyCluster->get_stats_proxysql_servers_metrics();
 	//if (resultset==NULL) return;
@@ -4295,59 +5193,83 @@ int ProxySQL_Admin::flush_debug_levels_database_to_runtime(SQLite3DB *db) {
 
 
 void ProxySQL_Admin::__insert_or_ignore_maintable_select_disktable() {
-  admindb->execute("PRAGMA foreign_keys = OFF");
-  admindb->execute("INSERT OR IGNORE INTO main.mysql_servers SELECT * FROM disk.mysql_servers");
-  admindb->execute("INSERT OR IGNORE INTO main.mysql_replication_hostgroups SELECT * FROM disk.mysql_replication_hostgroups");
-  admindb->execute("INSERT OR IGNORE INTO main.mysql_group_replication_hostgroups SELECT * FROM disk.mysql_group_replication_hostgroups");
-  admindb->execute("INSERT OR IGNORE INTO main.mysql_users SELECT * FROM disk.mysql_users");
+	admindb->execute("PRAGMA foreign_keys = OFF");
+	admindb->execute("INSERT OR IGNORE INTO main.mysql_servers SELECT * FROM disk.mysql_servers");
+	admindb->execute("INSERT OR IGNORE INTO main.mysql_replication_hostgroups SELECT * FROM disk.mysql_replication_hostgroups");
+	admindb->execute("INSERT OR IGNORE INTO main.mysql_group_replication_hostgroups SELECT * FROM disk.mysql_group_replication_hostgroups");
+	admindb->execute("INSERT OR IGNORE INTO main.mysql_users SELECT * FROM disk.mysql_users");
 	admindb->execute("INSERT OR IGNORE INTO main.mysql_query_rules SELECT * FROM disk.mysql_query_rules");
 	admindb->execute("INSERT OR IGNORE INTO main.global_variables SELECT * FROM disk.global_variables");
 	admindb->execute("INSERT OR IGNORE INTO main.scheduler SELECT * FROM disk.scheduler");
+	admindb->execute("INSERT OR IGNORE INTO main.proxysql_servers SELECT * FROM disk.proxysql_servers");
 #ifdef DEBUG
-  admindb->execute("INSERT OR IGNORE INTO main.debug_levels SELECT * FROM disk.debug_levels");
+	admindb->execute("INSERT OR IGNORE INTO main.debug_levels SELECT * FROM disk.debug_levels");
 #endif /* DEBUG */
-  admindb->execute("PRAGMA foreign_keys = ON");
+#ifdef PROXYSQLCLICKHOUSE
+	if ( GloVars.global.clickhouse_server == true ) {
+ 		admindb->execute("INSERT OR IGNORE INTO main.clickhouse_users SELECT * FROM disk.clickhouse_users");
+	}
+#endif /* PROXYSQLCLICKHOUSE */
+	admindb->execute("PRAGMA foreign_keys = ON");
 }
 
 void ProxySQL_Admin::__insert_or_replace_maintable_select_disktable() {
-  admindb->execute("PRAGMA foreign_keys = OFF");
-  admindb->execute("INSERT OR REPLACE INTO main.mysql_servers SELECT * FROM disk.mysql_servers");
-  admindb->execute("INSERT OR REPLACE INTO main.mysql_replication_hostgroups SELECT * FROM disk.mysql_replication_hostgroups");
-  admindb->execute("INSERT OR REPLACE INTO main.mysql_group_replication_hostgroups SELECT * FROM disk.mysql_group_replication_hostgroups");
-  admindb->execute("INSERT OR REPLACE INTO main.mysql_users SELECT * FROM disk.mysql_users");
+	admindb->execute("PRAGMA foreign_keys = OFF");
+	admindb->execute("INSERT OR REPLACE INTO main.mysql_servers SELECT * FROM disk.mysql_servers");
+	admindb->execute("INSERT OR REPLACE INTO main.mysql_replication_hostgroups SELECT * FROM disk.mysql_replication_hostgroups");
+	admindb->execute("INSERT OR REPLACE INTO main.mysql_group_replication_hostgroups SELECT * FROM disk.mysql_group_replication_hostgroups");
+	admindb->execute("INSERT OR REPLACE INTO main.mysql_users SELECT * FROM disk.mysql_users");
 	admindb->execute("INSERT OR REPLACE INTO main.mysql_query_rules SELECT * FROM disk.mysql_query_rules");
 	admindb->execute("INSERT OR REPLACE INTO main.global_variables SELECT * FROM disk.global_variables");
 	admindb->execute("INSERT OR REPLACE INTO main.scheduler SELECT * FROM disk.scheduler");
+	admindb->execute("INSERT OR REPLACE INTO main.proxysql_servers SELECT * FROM disk.proxysql_servers");
 #ifdef DEBUG
-  admindb->execute("INSERT OR IGNORE INTO main.debug_levels SELECT * FROM disk.debug_levels");
+	admindb->execute("INSERT OR IGNORE INTO main.debug_levels SELECT * FROM disk.debug_levels");
 #endif /* DEBUG */
-  admindb->execute("PRAGMA foreign_keys = ON");
+#ifdef PROXYSQLCLICKHOUSE
+	if ( GloVars.global.clickhouse_server == true ) {
+ 		admindb->execute("INSERT OR REPLACE INTO main.clickhouse_users SELECT * FROM disk.clickhouse_users");
+	}
+#endif /* PROXYSQLCLICKHOUSE */
+	admindb->execute("PRAGMA foreign_keys = ON");
 }
 
 void ProxySQL_Admin::__delete_disktable() {
-  admindb->execute("DELETE FROM disk.mysql_servers");
-  admindb->execute("DELETE FROM disk.mysql_replication_hostgroups");
-  admindb->execute("DELETE FROM disk.mysql_users");
+	admindb->execute("DELETE FROM disk.mysql_servers");
+	admindb->execute("DELETE FROM disk.mysql_replication_hostgroups");
+	admindb->execute("DELETE FROM disk.mysql_users");
 	admindb->execute("DELETE FROM disk.mysql_query_rules");
 	admindb->execute("DELETE FROM disk.global_variables");
 	admindb->execute("DELETE FROM disk.scheduler");
+	admindb->execute("DELETE FROM disk.proxysql_servers");
 #ifdef DEBUG
-  admindb->execute("DELETE FROM disk.debug_levels");
+	admindb->execute("DELETE FROM disk.debug_levels");
 #endif /* DEBUG */
+#ifdef PROXYSQLCLICKHOUSE
+	if ( GloVars.global.clickhouse_server == true ) {
+		admindb->execute("DELETE FROM disk.clickhouse_users");
+	}
+#endif /* PROXYSQLCLICKHOUSE */
 }
 
 void ProxySQL_Admin::__insert_or_replace_disktable_select_maintable() {
-  admindb->execute("INSERT OR REPLACE INTO disk.mysql_servers SELECT * FROM main.mysql_servers");
-  admindb->execute("INSERT OR REPLACE INTO disk.mysql_replication_hostgroups SELECT * FROM main.mysql_replication_hostgroups");
-  admindb->execute("INSERT OR REPLACE INTO disk.mysql_group_replication_hostgroups SELECT * FROM main.mysql_group_replication_hostgroups");
-  admindb->execute("INSERT OR REPLACE INTO disk.mysql_query_rules SELECT * FROM main.mysql_query_rules");
-  admindb->execute("INSERT OR REPLACE INTO disk.mysql_users SELECT * FROM main.mysql_users");
+	admindb->execute("INSERT OR REPLACE INTO disk.mysql_servers SELECT * FROM main.mysql_servers");
+	admindb->execute("INSERT OR REPLACE INTO disk.mysql_replication_hostgroups SELECT * FROM main.mysql_replication_hostgroups");
+	admindb->execute("INSERT OR REPLACE INTO disk.mysql_group_replication_hostgroups SELECT * FROM main.mysql_group_replication_hostgroups");
+	admindb->execute("INSERT OR REPLACE INTO disk.mysql_query_rules SELECT * FROM main.mysql_query_rules");
+	admindb->execute("INSERT OR REPLACE INTO disk.mysql_users SELECT * FROM main.mysql_users");
 	admindb->execute("INSERT OR REPLACE INTO disk.mysql_query_rules SELECT * FROM main.mysql_query_rules");
 	admindb->execute("INSERT OR REPLACE INTO disk.global_variables SELECT * FROM main.global_variables");
 	admindb->execute("INSERT OR REPLACE INTO disk.scheduler SELECT * FROM main.scheduler");
+	admindb->execute("INSERT OR REPLACE INTO disk.proxysql_servers SELECT * FROM main.proxysql_servers");
 #ifdef DEBUG
-  admindb->execute("INSERT OR REPLACE INTO disk.debug_levels SELECT * FROM main.debug_levels");
+	admindb->execute("INSERT OR REPLACE INTO disk.debug_levels SELECT * FROM main.debug_levels");
 #endif /* DEBUG */
+#ifdef PROXYSQLCLICKHOUSE
+	if ( GloVars.global.clickhouse_server == true ) {
+ 		admindb->execute("INSERT OR REPLACE INTO disk.clickhouse_users SELECT * FROM main.clickhouse_users");
+	}
+#endif /* PROXYSQLCLICKHOUSE */
 }
 
 
@@ -4368,6 +5290,26 @@ void ProxySQL_Admin::flush_mysql_users__from_memory_to_disk() {
 	admindb->execute("PRAGMA foreign_keys = ON");
 	admindb->wrunlock();
 }
+
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::flush_clickhouse_users__from_disk_to_memory() {
+	admindb->wrlock();
+	admindb->execute("PRAGMA foreign_keys = OFF");
+	admindb->execute("DELETE FROM main.clickhouse_users");
+	admindb->execute("INSERT INTO main.clickhouse_users SELECT * FROM disk.clickhouse_users");
+	admindb->execute("PRAGMA foreign_keys = ON");
+	admindb->wrunlock();
+}
+
+void ProxySQL_Admin::flush_clickhouse_users__from_memory_to_disk() {
+	admindb->wrlock();
+	admindb->execute("PRAGMA foreign_keys = OFF");
+	admindb->execute("DELETE FROM disk.clickhouse_users");
+	admindb->execute("INSERT INTO disk.clickhouse_users SELECT * FROM main.clickhouse_users");
+	admindb->execute("PRAGMA foreign_keys = ON");
+	admindb->wrunlock();
+}
+#endif /* PROXYSQLCLICKHOUSE */
 
 void ProxySQL_Admin::flush_scheduler__from_disk_to_memory() {
 	admindb->wrlock();
@@ -4443,10 +5385,22 @@ void ProxySQL_Admin::init_users() {
 	pthread_mutex_unlock(&users_mutex);
 }
 
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::init_clickhouse_users() {
+	pthread_mutex_lock(&users_mutex);
+	__refresh_clickhouse_users();
+	pthread_mutex_unlock(&users_mutex);
+}
+#endif /* PROXYSQLCLICKHOUSE */
+
 void ProxySQL_Admin::init_mysql_servers() {
 	mysql_servers_wrlock();
 	load_mysql_servers_to_runtime();
 	mysql_servers_wrunlock();
+}
+
+void ProxySQL_Admin::init_proxysql_servers() {
+	load_proxysql_servers_to_runtime();
 }
 
 void ProxySQL_Admin::init_mysql_query_rules() {
@@ -4464,17 +5418,64 @@ void ProxySQL_Admin::add_admin_users() {
 }
 
 void ProxySQL_Admin::__refresh_users() {
+	bool calculate_checksum = false;
+	if (checksum_variables.checksum_mysql_servers) {
+		calculate_checksum = true;
+	}
+	if (calculate_checksum)
+		pthread_mutex_lock(&GloVars.checksum_mutex);
 	__delete_inactive_users(USERNAME_BACKEND);
 	__delete_inactive_users(USERNAME_FRONTEND);
 	GloMyAuth->set_all_inactive(USERNAME_BACKEND);
 	GloMyAuth->set_all_inactive(USERNAME_FRONTEND);
 	add_admin_users();
-	__add_active_users(USERNAME_BACKEND);
-	__add_active_users(USERNAME_FRONTEND);
+
+//	uint64_t hashB, hashF;
+//	if (calculate_checksum) {
+//		__add_active_users(USERNAME_BACKEND, NULL, &hashB);
+//		__add_active_users(USERNAME_FRONTEND, NULL, &hashF);
+//	} else {
+		__add_active_users(USERNAME_BACKEND);
+		__add_active_users(USERNAME_FRONTEND);
+//	}
 	GloMyAuth->remove_inactives(USERNAME_BACKEND);
 	GloMyAuth->remove_inactives(USERNAME_FRONTEND);
+	uint64_t hash1 = 0;
+	if (calculate_checksum) {
+	}
 	set_variable((char *)"admin_credentials",(char *)"");
+	if (calculate_checksum) {
+		hash1 = GloMyAuth->get_runtime_checksum();
+		//uint64_t hash1 = hashB + hashF; // overflow allowed
+		uint32_t d32[2];
+		char buf[20];
+		memcpy(&d32, &hash1, sizeof(hash1));
+		sprintf(buf,"0x%0X%0X", d32[0], d32[1]);
+		GloVars.checksums_values.mysql_users.set_checksum(buf);
+		GloVars.checksums_values.mysql_users.version++;
+		time_t t = time(NULL);
+		GloVars.checksums_values.mysql_users.epoch = t;
+		GloVars.epoch_version = t;
+		GloVars.generate_global_checksum();
+		GloVars.checksums_values.updates_cnt++;
+		pthread_mutex_unlock(&GloVars.checksum_mutex);
+	}
 }
+
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::__refresh_clickhouse_users() {
+	//__delete_inactive_clickhouse_users(USERNAME_BACKEND);
+	__delete_inactive_clickhouse_users();
+	//GloMyAuth->set_all_inactive(USERNAME_BACKEND);
+	GloClickHouseAuth->set_all_inactive(USERNAME_FRONTEND);
+	//add_admin_users();
+	//_add_active_users(USERNAME_BACKEND);
+	__add_active_clickhouse_users();
+	//GloMyAuth->remove_inactives(USERNAME_BACKEND);
+	GloClickHouseAuth->remove_inactives(USERNAME_FRONTEND);
+	//set_variable((char *)"admin_credentials",(char *)"");
+}
+#endif /* PROXYSQLCLICKHOUSE */
 
 void ProxySQL_Admin::send_MySQL_OK(MySQL_Protocol *myprot, char *msg, int rows) {
 	assert(myprot);
@@ -4513,11 +5514,39 @@ void ProxySQL_Admin::__delete_inactive_users(enum cred_username_type usertype) {
 	free(query);
 }
 
-#define ADDUSER_STMT_RAW
-void ProxySQL_Admin::__add_active_users(enum cred_username_type usertype, char *__user) {
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::__delete_inactive_clickhouse_users() {
 	char *error=NULL;
 	int cols=0;
 	int affected_rows=0;
+	SQLite3_result *resultset=NULL;
+	char *str=(char *)"SELECT username FROM main.mysql_users WHERE active=0";
+	//char *query=(char *)malloc(strlen(str)+15);
+	//sprintf(query,str,(usertype==USERNAME_BACKEND ? "backend" : "frontend"));
+	admindb->execute_statement(str, &error , &cols , &affected_rows , &resultset);
+	if (error) {
+		proxy_error("Error on %s : %s\n", str, error);
+	} else {
+		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+			SQLite3_row *r=*it;
+			GloClickHouseAuth->del(r->fields[0], USERNAME_FRONTEND);
+		}
+	}
+	if (resultset) delete resultset;
+	//free(query);
+}
+#endif /* PROXYSQLCLICKHOUSE */
+
+#define ADDUSER_STMT_RAW
+void ProxySQL_Admin::__add_active_users(enum cred_username_type usertype, char *__user, uint64_t *hash1) {
+	char *error=NULL;
+	int cols=0;
+	int affected_rows=0;
+	bool empty = true;
+	SpookyHash myhash;
+	if (hash1) {
+		myhash.Init(19,3);
+	}
 #ifdef ADDUSER_STMT_RAW
 	sqlite3_stmt *statement=NULL;
 #else
@@ -4526,7 +5555,11 @@ void ProxySQL_Admin::__add_active_users(enum cred_username_type usertype, char *
 	char *str=NULL;
 	char *query=NULL;
 	if (__user==NULL) {
-		str=(char *)"SELECT username,password,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,max_connections FROM main.mysql_users WHERE %s=1 AND active=1 AND default_hostgroup>=0";
+		if (hash1) {
+			str=(char *)"SELECT username,password,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,max_connections FROM main.mysql_users WHERE %s=1 AND active=1 AND default_hostgroup>=0 ORDER BY username";
+		} else {
+			str=(char *)"SELECT username,password,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,max_connections FROM main.mysql_users WHERE %s=1 AND active=1 AND default_hostgroup>=0";
+		}
 		query=(char *)malloc(strlen(str)+15);
 		sprintf(query,str,(usertype==USERNAME_BACKEND ? "backend" : "frontend"));
 	} else {
@@ -4547,6 +5580,17 @@ void ProxySQL_Admin::__add_active_users(enum cred_username_type usertype, char *
 		while ((rc=sqlite3_step(statement))==SQLITE_ROW) {
 			SQLite3_row *r=new SQLite3_row(cols);
 			r->add_fields(statement);
+			if (hash1) {
+				empty = false;
+				for (int i=0; i<cols;i++) {
+					if (r->fields[i]) {
+						myhash.Update(r->fields[i],r->sizes[i]);
+					} else {
+						myhash.Update("",0);
+					}
+				}
+			}
+
 #else
 		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
 	      SQLite3_row *r=*it;
@@ -4603,12 +5647,192 @@ void ProxySQL_Admin::__add_active_users(enum cred_username_type usertype, char *
 	if (statement) {
 		sqlite3_finalize(statement);
 	}
+	if (hash1) {
+		uint64_t h1, h2;
+		myhash.Final(&h1, &h2);
+		*hash1 = h1;
+		if (empty) {
+			*hash1 = 0;
+		}
+	}
 #else
 	if (resultset) delete resultset;
 #endif
 	free(query);
 }
 
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::__add_active_clickhouse_users(char *__user) {
+	char *error=NULL;
+	int cols=0;
+	int affected_rows=0;
+#ifdef ADDUSER_STMT_RAW
+	sqlite3_stmt *statement=NULL;
+#else
+	SQLite3_result *resultset=NULL;
+#endif
+	char *str=NULL;
+	char *query=NULL;
+	if (__user==NULL) {
+		str=(char *)"SELECT username,password,max_connections FROM main.clickhouse_users WHERE active=1";
+		//query=(char *)malloc(strlen(str)+15);
+		//sprintf(query,str,(usertype==USERNAME_BACKEND ? "backend" : "frontend"));
+		query=strdup(str);
+	} else {
+		str=(char *)"SELECT username,password,max_connections FROM main.clickhouse_users WHERE active=1 AND username='%s'";
+		query=(char *)malloc(strlen(str)+strlen(__user)+15);
+		//sprintf(query,str,(usertype==USERNAME_BACKEND ? "backend" : "frontend"),__user);
+		sprintf(query,str,__user);
+	}
+#ifdef ADDUSER_STMT_RAW
+	admindb->execute_statement_raw(query, &error , &cols , &affected_rows , &statement);
+#else
+	admindb->execute_statement(query, &error , &cols , &affected_rows , &resultset);
+#endif
+	if (error) {
+		proxy_error("Error on %s : %s\n", query, error);
+	} else {
+#ifdef ADDUSER_STMT_RAW
+		int rc;
+		while ((rc=sqlite3_step(statement))==SQLITE_ROW) {
+			SQLite3_row *r=new SQLite3_row(cols);
+			r->add_fields(statement);
+#else
+		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+	      SQLite3_row *r=*it;
+#endif
+			char *password=NULL;
+/*
+			// FOR CLICKHOUSE, FOR NOW WE DISABLE PASSWORD HASHING
+			if (variables.hash_passwords) { // We must use hashed password. See issue #676
+				// Admin needs to hash the password
+				if (r->fields[1] && strlen(r->fields[1])) {
+					if (r->fields[1][0]=='*') { // the password is already hashed
+						password=strdup(r->fields[1]);
+					} else { // we must hash it
+						uint8 hash_stage1[SHA_DIGEST_LENGTH];
+						uint8 hash_stage2[SHA_DIGEST_LENGTH];
+						SHA_CTX sha1_context;
+						SHA1_Init(&sha1_context);
+						SHA1_Update(&sha1_context, r->fields[1], strlen(r->fields[1]));
+						SHA1_Final(hash_stage1, &sha1_context);
+						SHA1_Init(&sha1_context);
+						SHA1_Update(&sha1_context,hash_stage1,SHA_DIGEST_LENGTH);
+						SHA1_Final(hash_stage2, &sha1_context);
+						password=sha1_pass_hex((char *)hash_stage2); // note that sha1_pass_hex() returns a new buffer
+					}
+				} else {
+					password=strdup((char *)""); // we also generate a new string if hash_passwords is set
+				}
+			} else {
+*/
+				if (r->fields[1]) {
+					password=r->fields[1];
+				} else {
+					password=(char *)"";
+				}
+//			}
+			GloClickHouseAuth->add(
+				r->fields[0], // username
+				password, // before #676, wewere always passing the password. Now it is possible that the password can be hashed
+				USERNAME_FRONTEND, // backend/frontend
+				false, // (strcmp(r->fields[2],"1")==0 ? true : false) , // use_ssl
+				0, // atoi(r->fields[3]), // default_hostgroup
+				(char *)"", // (r->fields[4]==NULL ? (char *)"" : r->fields[4]), //default_schema
+				false, // (strcmp(r->fields[5],"1")==0 ? true : false) , // schema_locked
+				false, // (strcmp(r->fields[6],"1")==0 ? true : false) , // transaction_persistent
+				false, // (strcmp(r->fields[7],"1")==0 ? true : false), // fast_forward
+				( atoi(r->fields[2])>0 ? atoi(r->fields[2]) : 0)  // max_connections
+			);
+			//if (variables.hash_passwords) {
+			//	free(password); // because we always generate a new string
+			//}
+#ifdef ADDUSER_STMT_RAW
+			delete r;
+#endif
+		}
+	}
+#ifdef ADDUSER_STMT_RAW
+	if (statement) {
+		sqlite3_finalize(statement);
+	}
+#else
+	if (resultset) delete resultset;
+#endif
+	free(query);
+}
+#endif /* PROXYSQLCLICKHOUSE */
+
+
+void ProxySQL_Admin::dump_checksums_values_table() {
+	pthread_mutex_lock(&GloVars.checksum_mutex);
+	if (GloVars.checksums_values.updates_cnt == GloVars.checksums_values.dumped_at) {
+		// exit immediately
+		pthread_mutex_unlock(&GloVars.checksum_mutex);
+		return;
+	} else {
+		GloVars.checksums_values.dumped_at = GloVars.checksums_values.updates_cnt;
+	}
+	char *q = (char *)"REPLACE INTO runtime_checksums_values VALUES (?1 , ?2 , ?3 , ?4)";
+	sqlite3_stmt *statement1 = NULL;
+	sqlite3 *mydb3 = admindb->get_db();
+	rc=sqlite3_prepare_v2(mydb3, q, -1, &statement1, 0);
+	assert(rc==SQLITE_OK);
+	admindb->execute((char *)"BEGIN");
+	admindb->execute((char *)"DELETE FROM runtime_checksums_values");
+
+	rc=sqlite3_bind_text(statement1, 1, "admin_variables", -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 2, GloVars.checksums_values.admin_variables.version); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 3, GloVars.checksums_values.admin_variables.epoch); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_text(statement1, 4, GloVars.checksums_values.admin_variables.checksum, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	SAFE_SQLITE3_STEP(statement1);
+	rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+	rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+
+	rc=sqlite3_bind_text(statement1, 1, "mysql_query_rules", -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 2, GloVars.checksums_values.mysql_query_rules.version); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 3, GloVars.checksums_values.mysql_query_rules.epoch); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_text(statement1, 4, GloVars.checksums_values.mysql_query_rules.checksum, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	SAFE_SQLITE3_STEP(statement1);
+	rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+	rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+
+	rc=sqlite3_bind_text(statement1, 1, "mysql_servers", -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 2, GloVars.checksums_values.mysql_servers.version); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 3, GloVars.checksums_values.mysql_servers.epoch); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_text(statement1, 4, GloVars.checksums_values.mysql_servers.checksum, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	SAFE_SQLITE3_STEP(statement1);
+	rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+	rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+
+	rc=sqlite3_bind_text(statement1, 1, "mysql_users", -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 2, GloVars.checksums_values.mysql_users.version); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 3, GloVars.checksums_values.mysql_users.epoch); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_text(statement1, 4, GloVars.checksums_values.mysql_users.checksum, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	SAFE_SQLITE3_STEP(statement1);
+	rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+	rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+
+	rc=sqlite3_bind_text(statement1, 1, "mysql_variables", -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 2, GloVars.checksums_values.mysql_variables.version); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 3, GloVars.checksums_values.mysql_variables.epoch); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_text(statement1, 4, GloVars.checksums_values.mysql_variables.checksum, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	SAFE_SQLITE3_STEP(statement1);
+	rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+	rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+
+	rc=sqlite3_bind_text(statement1, 1, "proxysql_servers", -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 2, GloVars.checksums_values.proxysql_servers.version); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_int64(statement1, 3, GloVars.checksums_values.proxysql_servers.epoch); assert(rc==SQLITE_OK);
+	rc=sqlite3_bind_text(statement1, 4, GloVars.checksums_values.proxysql_servers.checksum, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+	SAFE_SQLITE3_STEP(statement1);
+	rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+	rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+
+	admindb->execute((char *)"COMMIT");
+	pthread_mutex_unlock(&GloVars.checksum_mutex);
+	sqlite3_finalize(statement1);
+}
 
 void ProxySQL_Admin::save_mysql_users_runtime_to_database(bool _runtime) {
 	char *query=NULL;
@@ -4700,6 +5924,111 @@ void ProxySQL_Admin::save_mysql_users_runtime_to_database(bool _runtime) {
 	}
 	free(ads);
 }
+
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Admin::save_clickhouse_users_runtime_to_database(bool _runtime) {
+	char *query=NULL;
+	if (_runtime) {
+		query=(char *)"DELETE FROM main.runtime_clickhouse_users";
+		admindb->execute(query);
+	} else {
+		char *qd=(char *)"UPDATE clickhouse_users SET active=0";
+		proxy_debug(PROXY_DEBUG_ADMIN, 4, "%s\n", qd);
+		admindb->execute(qd);
+	}
+	account_details_t **ads=NULL;
+	int num_users;
+	int i;
+/*
+	char *qf=(char *)"REPLACE INTO mysql_users(username,password,active,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,backend,frontend,max_connections) VALUES('%s','%s',1,%d,%d,'%s',%d,%d,%d,COALESCE((SELECT backend FROM mysql_users WHERE username='%s' AND frontend=1),0),1,%d)";
+	char *qb=(char *)"REPLACE INTO mysql_users(username,password,active,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,backend,frontend,max_connections) VALUES('%s','%s',1,%d,%d,'%s',%d,%d,%d,1,COALESCE((SELECT frontend FROM mysql_users WHERE username='%s' AND backend=1),0),%d)";
+	char *qfr=(char *)"REPLACE INTO runtime_mysql_users(username,password,active,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,backend,frontend,max_connections) VALUES('%s','%s',1,%d,%d,'%s',%d,%d,%d,COALESCE((SELECT backend FROM runtime_mysql_users WHERE username='%s' AND frontend=1),0),1,%d)";
+	char *qbr=(char *)"REPLACE INTO runtime_mysql_users(username,password,active,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,backend,frontend,max_connections) VALUES('%s','%s',1,%d,%d,'%s',%d,%d,%d,1,COALESCE((SELECT frontend FROM runtime_mysql_users WHERE username='%s' AND backend=1),0),%d)";
+	char *qfr_stmt1=(char *)"REPLACE INTO runtime_mysql_users(username,password,active,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,backend,frontend,max_connections) VALUES(?1,?2,1,?3,?4,?5,?6,?7,?8,COALESCE((SELECT backend FROM runtime_mysql_users WHERE username=?9 AND frontend=1),0),1,?10)";
+	char *qbr_stmt1=(char *)"REPLACE INTO runtime_mysql_users(username,password,active,use_ssl,default_hostgroup,default_schema,schema_locked,transaction_persistent,fast_forward,backend,frontend,max_connections) VALUES(?1,?2,1,?3,?4,?5,?6,?7,?8,1,COALESCE((SELECT frontend FROM runtime_mysql_users WHERE username=?9 AND backend=1),0),?10)";
+*/
+	char *qf=(char *)"REPLACE INTO clickhouse_users(username,password,active,max_connections) VALUES('%s','%s',1,%d)";
+	char *qb=(char *)"REPLACE INTO clickhouse_users(username,password,active,max_connections) VALUES('%s','%s',1,%d)";
+	char *qfr=(char *)"REPLACE INTO runtime_clickhouse_users(username,password,active,max_connections) VALUES('%s','%s',1,%d)";
+	char *qbr=(char *)"REPLACE INTO runtime_clickhouse_users(username,password,active,max_connections) VALUES('%s','%s',1,%d)";
+	char *qfr_stmt1=(char *)"REPLACE INTO runtime_clickhouse_users(username,password,active,max_connections) VALUES(?1,?2,1,?3)";
+	char *qbr_stmt1=(char *)"REPLACE INTO runtime_clickhouse_users(username,password,active,max_connections) VALUES(?1,?2,1,?3)";
+	num_users=GloClickHouseAuth->dump_all_users(&ads);
+	if (num_users==0) return;
+	char *q_stmt1_f=NULL;
+	char *q_stmt1_b=NULL;
+	sqlite3_stmt *f_statement1=NULL;
+	sqlite3_stmt *b_statement1=NULL;
+	sqlite3 *mydb3=admindb->get_db();
+	if (_runtime) {
+		int rc;
+		q_stmt1_f=qfr_stmt1;
+		q_stmt1_b=qbr_stmt1;
+		rc=sqlite3_prepare_v2(mydb3, q_stmt1_f, -1, &f_statement1, 0);
+		assert(rc==SQLITE_OK);
+		rc=sqlite3_prepare_v2(mydb3, q_stmt1_b, -1, &b_statement1, 0);
+		assert(rc==SQLITE_OK);
+	}
+	for (i=0; i<num_users; i++) {
+	//fprintf(stderr,"%s %d\n", ads[i]->username, ads[i]->default_hostgroup);
+		account_details_t *ad=ads[i];
+		sqlite3_stmt *statement1=NULL;
+		if (ads[i]->default_hostgroup >= 0) {
+			char *q=NULL;
+			if (_runtime==false) {
+				if (ad->__frontend) {
+					q=qf;
+				} else {
+					q=qb;
+				}
+			} else { // _runtime==true
+				if (ad->__frontend) {
+					q=qfr;
+					statement1=f_statement1;
+				} else {
+					q=qbr;
+					statement1=b_statement1;
+				}
+			}
+			if (_runtime==false) {
+				query=(char *)malloc(strlen(q)+strlen(ad->username)*2+strlen(ad->password)+strlen(ad->default_schema)+256);
+				//sprintf(query, q, ad->username, ad->password, ad->use_ssl, ad->default_hostgroup, ad->default_schema, ad->schema_locked, ad->transaction_persistent, ad->fast_forward, ad->username, ad->max_connections);
+				sprintf(query, q, ad->username, ad->password, ad->max_connections);
+				//fprintf(stderr,"%s\n",query);
+				proxy_debug(PROXY_DEBUG_ADMIN, 4, "%s\n", query);
+				admindb->execute(query);
+				free(query);
+			} else {
+				rc=sqlite3_bind_text(statement1, 1, ad->username, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_text(statement1, 2, ad->password, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_int64(statement1, 3, ad->max_connections); assert(rc==SQLITE_OK);
+/*
+				rc=sqlite3_bind_int64(statement1, 3, ad->use_ssl); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_int64(statement1, 4, ad->default_hostgroup); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_text(statement1, 5, ad->default_schema, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_int64(statement1, 6, ad->schema_locked); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_int64(statement1, 7, ad->transaction_persistent); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_int64(statement1, 8, ad->fast_forward); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_text(statement1, 9, ad->username, -1, SQLITE_TRANSIENT); assert(rc==SQLITE_OK);
+				rc=sqlite3_bind_int64(statement1, 10, ad->max_connections); assert(rc==SQLITE_OK);
+*/
+				SAFE_SQLITE3_STEP(statement1);
+				rc=sqlite3_clear_bindings(statement1); assert(rc==SQLITE_OK);
+				rc=sqlite3_reset(statement1); assert(rc==SQLITE_OK);
+			}
+		}
+		free(ad->username);
+		free(ad->password); // this is not initialized with dump_all_users( , false)
+		free(ad->default_schema); // this is not initialized with dump_all_users( , false)
+		free(ad);
+	}
+	if (_runtime) {
+		sqlite3_finalize(f_statement1);
+		sqlite3_finalize(b_statement1);
+	}
+	free(ads);
+}
+#endif /* PROXYSQLCLICKHOUSE */
 
 void ProxySQL_Admin::stats___mysql_users() {
 	account_details_t **ads=NULL;
@@ -5098,12 +6427,28 @@ char * ProxySQL_Admin::load_mysql_query_rules_to_runtime() {
 	int affected_rows=0;
 	if (GloQPro==NULL) return (char *)"Global Query Processor not started: command impossible to run";
 	SQLite3_result *resultset=NULL;
-	char *query=(char *)"SELECT rule_id, username, schemaname, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, log, apply, comment FROM main.mysql_query_rules WHERE active=1";
+	char *query=(char *)"SELECT rule_id, username, schemaname, flagIN, client_addr, proxy_addr, proxy_port, digest, match_digest, match_pattern, negate_match_pattern, re_modifiers, flagOUT, replace_pattern, destination_hostgroup, cache_ttl, reconnect, timeout, retries, delay, next_query_flagIN, mirror_flagOUT, mirror_hostgroup, error_msg, ok_msg, sticky_conn, multiplex, log, apply, comment FROM main.mysql_query_rules WHERE active=1 ORDER BY rule_id";
 	admindb->execute_statement(query, &error , &cols , &affected_rows , &resultset);
 	if (error) {
 		proxy_error("Error on %s : %s\n", query, error);
 	} else {
 		GloQPro->wrlock();
+		if (checksum_variables.checksum_mysql_query_rules) {
+			pthread_mutex_lock(&GloVars.checksum_mutex);
+			uint64_t hash1 = resultset->raw_checksum();
+			uint32_t d32[2];
+			char buf[20];
+			memcpy(&d32, &hash1, sizeof(hash1));
+			sprintf(buf,"0x%0X%0X", d32[0], d32[1]);
+			GloVars.checksums_values.mysql_query_rules.set_checksum(buf);
+			GloVars.checksums_values.mysql_query_rules.version++;
+			time_t t = time(NULL);
+			GloVars.checksums_values.mysql_query_rules.epoch = t;
+			GloVars.epoch_version = t;
+			GloVars.generate_global_checksum();
+			GloVars.checksums_values.updates_cnt++;
+			pthread_mutex_unlock(&GloVars.checksum_mutex);
+		}
 		GloQPro->reset_all(false);
 		QP_rule_t * nqpr;
 		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
@@ -5602,7 +6947,11 @@ int ProxySQL_Admin::Read_MySQL_Servers_from_configfile() {
 			int use_ssl=0;
 			int max_latency_ms=0;
 			std::string comment="";
-			if (server.lookupValue("address", address)==false) continue;
+			if (server.lookupValue("address", address)==false) {
+				if (server.lookupValue("hostname", address)==false) {
+					continue;
+				}
+			}
 			if (server.lookupValue("port", port)==false) continue;
 			if (server.lookupValue("hostgroup", hostgroup)==false) continue;
 			server.lookupValue("status", status);
@@ -5649,6 +6998,47 @@ int ProxySQL_Admin::Read_MySQL_Servers_from_configfile() {
 			char *o=escape_string_single_quotes(o1, false);
 			char *query=(char *)malloc(strlen(q)+strlen(o)+32);
 			sprintf(query,q, writer_hostgroup, reader_hostgroup, o);
+			//fprintf(stderr, "%s\n", query);
+			admindb->execute(query);
+			if (o!=o1) free(o);
+			free(o1);
+			free(query);
+			rows++;
+		}
+	}
+	admindb->execute("PRAGMA foreign_keys = ON");
+	return rows;
+}
+
+int ProxySQL_Admin::Read_ProxySQL_Servers_from_configfile() {
+	const Setting& root = GloVars.confFile->cfg->getRoot();
+	int i;
+	int rows=0;
+	admindb->execute("PRAGMA foreign_keys = OFF");
+	if (root.exists("proxysql_servers")==true) {
+		const Setting &mysql_servers = root["proxysql_servers"];
+		int count = mysql_servers.getLength();
+		//fprintf(stderr, "Found %d servers\n",count);
+		char *q=(char *)"INSERT OR REPLACE INTO proxysql_servers (hostname, port, weight, comment) VALUES (\"%s\", %d, %d, '%s')";
+		for (i=0; i< count; i++) {
+			const Setting &server = mysql_servers[i];
+			std::string address;
+			int port;
+			int weight=0;
+			std::string comment="";
+			if (server.lookupValue("address", address)==false) {
+				if (server.lookupValue("hostname", address)==false) {
+					continue;
+				}
+			}
+			if (server.lookupValue("port", port)==false) continue;
+			server.lookupValue("weight", weight);
+			server.lookupValue("comment", comment);
+			char *o1=strdup(comment.c_str());
+			char *o=escape_string_single_quotes(o1, false);
+			char *query=(char *)malloc(strlen(q)+strlen(address.c_str())+strlen(o)+128);
+			sprintf(query, q, address.c_str(), port, weight, o);
+			proxy_info("Cluster: Adding ProxySQL Servers %s:%d from config file\n", address.c_str(), port);
 			//fprintf(stderr, "%s\n", query);
 			admindb->execute(query);
 			if (o!=o1) free(o);
@@ -6138,19 +7528,35 @@ unsigned long long ProxySQL_External_Scheduler::run_once() {
 	return next_run;
 }
 
-void ProxySQL_Admin::load_proxysql_servers_to_runtime() {
+void ProxySQL_Admin::load_proxysql_servers_to_runtime(bool _lock) {
 	// make sure that the caller has called mysql_servers_wrlock()
 	char *error=NULL;
 	int cols=0;
 	int affected_rows=0;
 	SQLite3_result *resultset=NULL;
-	char *query=(char *)"SELECT hostname,port,weight,comment FROM proxysql_servers";
+	char *query=(char *)"SELECT hostname, port, weight, comment FROM proxysql_servers ORDER BY hostname, port";
 	proxy_debug(PROXY_DEBUG_ADMIN, 4, "%s\n", query);
 	admindb->execute_statement(query, &error , &cols , &affected_rows , &resultset);
 	if (error) {
 		proxy_error("Error on %s : %s\n", query, error);
 	} else {
-		GloProxyCluster->load_servers_list(resultset);
+		GloProxyCluster->load_servers_list(resultset, _lock);
+//		if (checksum_variables.checksum_mysql_query_rules) {
+			pthread_mutex_lock(&GloVars.checksum_mutex);
+			uint64_t hash1 = resultset->raw_checksum();
+			uint32_t d32[2];
+			char buf[20];
+			memcpy(&d32, &hash1, sizeof(hash1));
+			sprintf(buf,"0x%0X%0X", d32[0], d32[1]);
+			GloVars.checksums_values.proxysql_servers.set_checksum(buf);
+			GloVars.checksums_values.proxysql_servers.version++;
+			time_t t = time(NULL);
+			GloVars.checksums_values.proxysql_servers.epoch = t;
+			GloVars.epoch_version = t;
+			GloVars.generate_global_checksum();
+			GloVars.checksums_values.updates_cnt++;
+			pthread_mutex_unlock(&GloVars.checksum_mutex);
+//		}
 	}
 	if (resultset) delete resultset;
 	resultset=NULL;

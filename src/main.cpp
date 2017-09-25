@@ -176,6 +176,9 @@ int socket_fd;
 
 Query_Cache *GloQC;
 MySQL_Authentication *GloMyAuth;
+#ifdef PROXYSQLCLICKHOUSE
+ClickHouse_Authentication *GloClickHouseAuth;
+#endif /* PROXYSQLCLICKHOUSE */
 Query_Processor *GloQPro;
 ProxySQL_Admin *GloAdmin;
 MySQL_Threads_Handler *GloMTH;
@@ -191,6 +194,10 @@ std::thread *MyMon_thread;
 
 MySQL_Logger *GloMyLogger;
 
+SQLite3_Server *GloSQLite3Server;
+#ifdef PROXYSQLCLICKHOUSE
+ClickHouse_Server *GloClickHouseServer;
+#endif /* PROXYSQLCLICKHOUSE */
 
 
 ProxySQL_Cluster *GloProxyCluster = NULL;
@@ -326,6 +333,9 @@ void ProxySQL_Main_init_main_modules() {
 	GloQPro=NULL;
 	GloMTH=NULL;
 	GloMyAuth=NULL;
+#ifdef PROXYSQLCLICKHOUSE
+	GloClickHouseAuth=NULL;
+#endif /* PROXYSQLCLICKHOUSE */
 	GloMyMon=NULL;
 	GloMyLogger=NULL;
 	GloMyStmt=NULL;
@@ -395,6 +405,27 @@ void ProxySQL_Main_init_MySQL_Monitor_module() {
 	GloMyMon->print_version();
 }
 
+
+void ProxySQL_Main_init_SQLite3Server() {
+	// start SQLite3Server
+	GloSQLite3Server = new SQLite3_Server();
+	GloSQLite3Server->init();
+	GloAdmin->init_sqliteserver_variables();
+	GloSQLite3Server->print_version();
+}
+#ifdef PROXYSQLCLICKHOUSE
+void ProxySQL_Main_init_ClickHouseServer() {
+	// start SQServer
+	GloClickHouseServer = new ClickHouse_Server();
+	GloClickHouseServer->init();
+	GloAdmin->init_clickhouse_variables();
+	GloClickHouseServer->print_version();
+	GloClickHouseAuth = new ClickHouse_Authentication();
+	GloClickHouseAuth->print_version();
+	GloAdmin->init_clickhouse_users();
+}
+#endif /* PROXYSQLCLICKHOUSE */
+
 void ProxySQL_Main_join_all_threads() {
 	cpu_timer t;
 	if (GloMTH) {
@@ -458,6 +489,32 @@ void ProxySQL_Main_shutdown_all_modules() {
 		GloQPro=NULL;
 #ifdef DEBUG
 		std::cerr << "GloQPro shutdown in ";
+#endif
+	}
+#ifdef PROXYSQLCLICKHOUSE
+	if (GloClickHouseAuth) {
+		cpu_timer t;
+		delete GloClickHouseAuth;
+		GloClickHouseAuth=NULL;
+#ifdef DEBUG
+		std::cerr << "GloClickHouseAuth shutdown in ";
+#endif
+	}
+	if (GloClickHouseServer) {
+		cpu_timer t;
+		delete GloClickHouseServer;
+		GloClickHouseServer=NULL;
+#ifdef DEBUG
+		std::cerr << "GloClickHouseServer shutdown in ";
+#endif
+	}
+#endif /* PROXYSQLCLICKHOUSE */
+	if (GloSQLite3Server) {
+		cpu_timer t;
+		delete GloSQLite3Server;
+		GloSQLite3Server=NULL;
+#ifdef DEBUG
+		std::cerr << "GloSQLite3Server shutdown in ";
 #endif
 	}
 	if (GloMyAuth) {
@@ -569,6 +626,7 @@ void ProxySQL_Main_init_phase3___start_all() {
 	{
 		cpu_timer t;
 		GloAdmin->init_mysql_servers();
+		GloAdmin->init_proxysql_servers();
 		GloAdmin->load_scheduler_to_runtime();
 #ifdef DEBUG
 		std::cerr << "Main phase3 : GloAdmin initialized in ";
@@ -614,6 +672,22 @@ void ProxySQL_Main_init_phase3___start_all() {
 			std::cerr << "Main phase3 : MySQL Monitor initialized in ";
 #endif
 		}
+	if ( GloVars.global.sqlite3_server == true ) {
+		cpu_timer t;
+		ProxySQL_Main_init_SQLite3Server();
+#ifdef DEBUG
+		std::cerr << "Main phase3 : SQLite3 Server initialized in ";
+#endif
+	}
+#ifdef PROXYSQLCLICKHOUSE
+	if ( GloVars.global.clickhouse_server == true ) {
+		cpu_timer t;
+		ProxySQL_Main_init_ClickHouseServer();
+#ifdef DEBUG
+		std::cerr << "Main phase3 : ClickHouse Server initialized in ";
+#endif
+	}
+#endif /* PROXYSQLCLICKHOUSE */
 }
 
 
